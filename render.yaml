@@ -3,10 +3,13 @@ services:
     name: telegram-summary-bot
     env: python
     plan: free
-    pythonVersion: "3.11"  # Добавляем эту строку
+    pythonVersion: "3.11"
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
         sync: false
-
+    # Добавляем настройки для web service
+    healthCheckPath: /health
+    # Порт для Render (даже если не используется)
+    port: 10000
