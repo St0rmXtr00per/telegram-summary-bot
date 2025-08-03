@@ -1,13 +1,16 @@
 import logging
 import os
-from telegram import Bot, Update
+import sys
+from telegram import Update
 from telegram.constants import ChatAction
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+
+# Добавим отладку версии Python
+print(f"Running with Python version: {sys.version}")
 
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-bot = Bot(BOT_TOKEN)
 
 async def summarize_text(text: str) -> str:
     return f"Сводка:\n{text[:500]}..."
@@ -49,8 +52,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(file_path)
 
 def main():
-    # Явное создание Application с минимальными параметрами
-    application = Application(bot=bot, update_queue=None)
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.run_polling()
 
