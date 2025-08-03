@@ -255,7 +255,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info("Creating episode summary...")
             summary = await summarize_episode_with_huggingface(episode_text, file_name)
             
-            await status_message.delete()
+            try:
+                await status_message.delete()
+            except Exception as e:
+                logger.warning(f"Could not delete status message: {e}")
             
             await message.reply_text(
                 summary, 
@@ -266,10 +269,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info("Successfully created episode summary")
         except Exception as e:
             logger.error(f"Error processing file {file_name}: {e}")
-            await status_message.edit_text(
-                f"❌ Ошибка при обработке файла: {str(e)}\n"
-                "Убедитесь, что файл содержит диалоги в формате [Персонаж]: текст"
-            )
+            try:
+                await status_message.edit_text(
+                    f"❌ Ошибка при обработке файла: {str(e)}\n"
+                    "Убедитесь, что файл содержит диалоги в формате [Персонаж]: текст"
+                )
+            except Exception as edit_error:
+                logger.error(f"Could not edit status message: {edit_error}")
+                try:
+                    await message.reply_text("❌ Произошла ошибка при обработке файла")
+                except Exception as reply_error:
+                    logger.error(f"Could not send error message: {reply_error}")
         finally:
             if os.path.exists(file_path):
                 try:
@@ -305,6 +315,9 @@ def run_async_task(coro):
 async def init_application():
     """Инициализация приложения"""
     global application
+    if application is not None:
+        return application
+        
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
     # Добавляем обработчики для сообщений и сообщений в каналах
@@ -313,6 +326,7 @@ async def init_application():
     
     # Инициализация приложения
     await application.initialize()
+    logger.info("Application initialized successfully")
     return application
 
 async def setup_webhook():
@@ -338,16 +352,33 @@ def webhook_handler():
         
         update = Update.de_json(update_json, application.bot)
         
-        # Запускаем асинхронную обработку в отдельном потоке
+        # Запускаем асинхронную обработку в отдельном потоке с новым циклом событий
         def process_update():
             try:
+                # Создаем новый цикл событий для этого потока
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                loop.run_until_complete(application.process_update(update))
-                loop.close()
+                
+                # Инициализируем приложение в новом цикле
+                async def run_update():
+                    try:
+                        await application.process_update(update)
+                    except Exception as e:
+                        logger.error(f"Error processing update: {e}")
+                
+                # Выполняем обработку
+                loop.run_until_complete(run_update())
+                
             except Exception as e:
                 logger.error(f"Error in update processing thread: {e}")
+            finally:
+                # Закрываем цикл только после завершения всех операций
+                try:
+                    loop.close()
+                except:
+                    pass
         
+        # Запускаем в отдельном потоке и не ждем завершения
         thread = threading.Thread(target=process_update)
         thread.daemon = True
         thread.start()
