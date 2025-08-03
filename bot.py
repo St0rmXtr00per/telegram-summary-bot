@@ -37,11 +37,6 @@ if not WEBHOOK_URL:
     logger.error("WEBHOOK_URL environment variable is not set!")
     sys.exit(1)
 
-# Инициализация бота
-application = ApplicationBuilder().token(BOT_TOKEN).build()
-application.add_handler(CommandHandler("start", start_command))
-application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
 # Функции для обработки текста и API (без изменений)
 def prepare_episode_text(text: str) -> str:
     """Подготавливает текст серии для анализа"""
@@ -202,7 +197,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик документов"""
-    # ... (код остается без изменений) ...
     try:
         logger.info("Received document message")
         
@@ -292,6 +286,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
+# Инициализация бота
+application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+# Теперь мы добавляем обработчики, когда все функции уже определены
+application.add_handler(CommandHandler("start", start_command))
+application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
 @app.route('/health')
 def health_check():
     return jsonify({"status": "healthy", "service": "telegram-bot"}), 200
@@ -318,7 +319,6 @@ async def setup_webhook():
 
 def main():
     """Главная функция для запуска Flask-сервера и настройки вебхука"""
-    # Запускаем Flask-сервер в режиме вебхука
     port = int(os.environ.get('PORT', 10000))
 
     # Сначала настраиваем вебхук
