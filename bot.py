@@ -3,7 +3,7 @@ import os
 import sys
 import asyncio
 import aiohttp
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
@@ -16,12 +16,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Flask app для вебхука
+app = Flask(__name__)
+
 # Получение токенов и настроек
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
 HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "IlyaGusev/mbart_ru_sum_gazeta")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-PORT = int(os.environ.get('PORT', 10000))
 
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN environment variable is not set!")
@@ -282,15 +284,37 @@ application = ApplicationBuilder().token(BOT_TOKEN).build()
 application.add_handler(CommandHandler("start", start_command))
 application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-async def main():
-    """Главная асинхронная функция для запуска бота"""
-    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
-        url_path=f"/{BOT_TOKEN}"
-    )
+async def setup_webhook():
+    """Настройка вебхука и инициализация приложения"""
+    await application.bot.set_webhook(f"{WEBHOOK_URL}/{BOT_TOKEN}")
+    logger.info(f"Webhook set to {WEBHOOK_URL}/{BOT_TOKEN}")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+async def webhook_handler():
+    try:
+        update_json = request.get_json(force=True)
+        # Инициализация здесь нужна, так как Flask запускает новый цикл событий
+        # при каждом запросе
+        await application.initialize() 
+        update = Update.de_json(update_json, application.bot)
+        await application.process_update(update)
+        return "ok"
+    except Exception as e:
+        logger.error(f"Error processing webhook update: {e}")
+        return "error", 500
+
+def main():
+    """Главная функция для запуска Flask-сервера и настройки вебхука"""
+    port = int(os.environ.get('PORT', 10000))
+
+    # Сначала настраиваем вебхук
+    # Мы не используем asyncio.run здесь, чтобы не создавать конфликт
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(setup_webhook())
+
+    # Затем запускаем Flask-приложение
+    logger.info(f"Starting Flask server on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=False)
+
+if __name__ == '__main__':
+    main()
