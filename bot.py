@@ -189,34 +189,38 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Просто отправьте файл и ждите пересказ!"""
     
-    await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
+    message = update.message or update.channel_post
+    if message:
+        await message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         logger.info("Received document message")
         
-        if not update.message or not update.message.document:
+        # Поддерживаем как личные сообщения, так и сообщения в каналах
+        message = update.message or update.channel_post
+        if not message or not message.document:
             logger.warning("No document in message")
             return
         
-        file = update.message.document
+        file = message.document
         file_name = file.file_name or "unknown"
         file_size = file.file_size or 0
         
         logger.info(f"Processing file: {file_name}, size: {file_size} bytes")
         
         if file_size > 20 * 1024 * 1024:
-            await update.message.reply_text("❌ Файл слишком большой (максимум 20MB)")
+            await message.reply_text("❌ Файл слишком большой (максимум 20MB)")
             return
         
         if not (file_name.lower().endswith('.docx') or file_name.lower().endswith('.srt')):
-            await update.message.reply_text(
+            await message.reply_text(
                 "❌ Поддерживаются только файлы .srt (субтитры) и .docx (документы)\n"
                 "Отправьте файл субтитров с диалогами персонажей."
             )
             return
         
-        status_message = await update.message.reply_text("🔄 Анализирую диалоги персонажей...")
+        status_message = await message.reply_text("🔄 Анализирую диалоги персонажей...")
         
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id, 
@@ -253,10 +257,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await status_message.delete()
             
-            await update.message.reply_text(
+            await message.reply_text(
                 summary, 
                 parse_mode=ParseMode.MARKDOWN,
-                reply_to_message_id=update.message.message_id
+                reply_to_message_id=message.message_id
             )
             
             logger.info("Successfully created episode summary")
@@ -277,7 +281,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Unexpected error in handle_document: {e}")
         try:
-            await update.message.reply_text("❌ Произошла непредвиденная ошибка")
+            message = update.message or update.channel_post
+            if message:
+                await message.reply_text("❌ Произошла непредвиденная ошибка")
         except:
             pass
 
@@ -301,9 +307,16 @@ async def init_application():
     global application
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # Добавляем обработчики
+    # Добавляем обработчики для сообщений и сообщений в каналах
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
+    # Добавляем поддержку обработки документов в каналах
+    from telegram.ext import MessageHandler
+    # Создаем отдельный фильтр для channel_post
+    channel_document_handler = MessageHandler(filters.Document.ALL, handle_document)
+    channel_document_handler.check_update = lambda update: update.channel_post and update.channel_post.document
+    application.add_handler(channel_document_handler)
     
     # Инициализация приложения
     await application.initialize()
