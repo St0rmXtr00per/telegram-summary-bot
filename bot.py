@@ -304,7 +304,6 @@ def index():
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 async def webhook_handler():
     try:
-        await application.initialize()
         update_json = request.get_json(force=True)
         update = Update.de_json(update_json, application.bot)
         await application.process_update(update)
@@ -314,7 +313,8 @@ async def webhook_handler():
         return "error", 500
 
 async def setup_webhook():
-    """Настройка вебхука"""
+    """Настройка вебхука и инициализация приложения"""
+    await application.initialize()
     await application.bot.set_webhook(f"{WEBHOOK_URL}/{BOT_TOKEN}")
     logger.info(f"Webhook set to {WEBHOOK_URL}/{BOT_TOKEN}")
 
