@@ -44,11 +44,13 @@ TELEGRAM_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 # Thread pool для обработки файлов
 executor = ThreadPoolExecutor(max_workers=3)
 
+def escape_markdown(text: str) -> str:
+    """Экранирует специальные символы Markdown для Telegram."""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return "".join(['\\' + char if char in escape_chars else char for char in text])
+
 def prepare_episode_text(text: str) -> str:
-    """
-    Подготавливает текст серии для анализа.
-    Не удаляет имена персонажей и скобки.
-    """
+    """Подготавливает текст серии для анализа."""
     lines = text.split('\n')
     cleaned_lines = []
     
@@ -69,9 +71,13 @@ def prepare_episode_text(text: str) -> str:
 
 def format_episode_summary(summary: str, file_name: str) -> str:
     episode_name = file_name.replace('.srt', '').replace('.docx', '')
-    formatted_summary = f"""📺 **Краткий пересказ: {episode_name}**
+    
+    # Экранируем текст от модели перед форматированием
+    escaped_summary = escape_markdown(summary.strip())
+    
+    formatted_summary = f"""📺 **Краткий пересказ: {escape_markdown(episode_name)}**
 
-||{summary.strip()}||
+||{escaped_summary}||
 
 _Пересказ создан на основе диалогов персонажей_"""
     
@@ -234,7 +240,7 @@ def call_huggingface_api(episode_text: str, file_name: str) -> str:
                             summary = summary.replace(prompt, '').strip()
                     
                     if summary:
-                        return format_episode_summary(summary, file_name)
+                        return summary
                     else:
                         return "❌ Модель не смогла создать пересказ"
                 else:
@@ -339,11 +345,18 @@ def process_document(update_data: dict):
             logger.info("Creating episode summary...")
             summary = call_huggingface_api(episode_text, file_name)
             
-            delete_message(chat_id, status_message_id)
-            
-            send_message(chat_id, summary, parse_mode="Markdown", reply_to_message_id=message_id)
-            
-            logger.info(f"Successfully created and sent summary for {file_name}")
+            if "❌" in summary: # Если вернулась ошибка, отправляем ее
+                delete_message(chat_id, status_message_id)
+                send_message(chat_id, summary)
+            else:
+                # В случае успеха форматируем и отправляем
+                formatted_summary = format_episode_summary(summary, file_name)
+                delete_message(chat_id, status_message_id)
+                send_message(chat_id, formatted_summary, parse_mode="Markdown", reply_to_message_id=message_id)
+
+            # ИЗМЕНЕНИЕ: Исправлена логика логгирования успеха
+            if "❌" not in summary:
+                logger.info(f"Successfully created and sent summary for {file_name}")
             
         except Exception as e:
             logger.error(f"Error processing file {file_name}: {e}")
