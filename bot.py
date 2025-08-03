@@ -2,7 +2,7 @@ import logging
 import os
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 logging.basicConfig(level=logging.INFO)
 
@@ -48,7 +48,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(file_path)
 
 def main():
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.run_polling()
 
