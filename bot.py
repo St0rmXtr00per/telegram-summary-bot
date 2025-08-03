@@ -5,9 +5,8 @@ import json
 import urllib.request
 import urllib.parse
 import urllib.error
-from flask import Flask, request, jsonify
+from flask import Flask, request
 from docx import Document
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 # Настройка логирования
@@ -248,6 +247,8 @@ def call_huggingface_api(episode_text: str, file_name: str) -> str:
         elif e.code == 429:
             return "⏳ Превышены лимиты API, попробуйте позже"
         else:
+            # ИЗМЕНЕНИЕ 1: Добавлено логирование проблемного текста
+            logger.error(f"Hugging Face API Error {e.code}. Problematic text: {episode_text}")
             return f"❌ Ошибка API: {e.code}"
     except Exception as e:
         logger.error(f"Error calling Hugging Face API: {e}")
@@ -255,10 +256,13 @@ def call_huggingface_api(episode_text: str, file_name: str) -> str:
 
 def process_document(update_data: dict):
     """Обработка документа"""
+    chat_id = None
+    status_message_id = None
+    file_name = "unknown"
+    
     try:
         logger.info("Processing document")
         
-        # Получаем данные из update
         if 'message' in update_data:
             message_data = update_data['message']
         elif 'channel_post' in update_data:
@@ -281,12 +285,10 @@ def process_document(update_data: dict):
         
         logger.info(f"Processing file: {file_name}, size: {file_size} bytes")
         
-        # Проверяем размер файла
         if file_size > 20 * 1024 * 1024:
             send_message(chat_id, "❌ Файл слишком большой (максимум 20MB)")
             return
         
-        # Проверяем расширение файла
         if not (file_name.lower().endswith('.docx') or file_name.lower().endswith('.srt')):
             send_message(
                 chat_id,
@@ -295,7 +297,6 @@ def process_document(update_data: dict):
             )
             return
         
-        # Отправляем статусное сообщение
         status_response = send_message(chat_id, "🔄 Анализирую диалоги персонажей...")
         if not status_response:
             logger.error("Failed to send status message")
@@ -305,13 +306,11 @@ def process_document(update_data: dict):
         file_path = f"/tmp/{file_name}"
         
         try:
-            # Загружаем файл
             logger.info("Downloading file...")
             if not download_file(file_id, file_path):
                 edit_message(chat_id, status_message_id, "❌ Ошибка при загрузке файла")
                 return
             
-            # Извлекаем текст
             logger.info("Extracting dialogue text...")
             if file_name.lower().endswith('.docx'):
                 raw_text = extract_text_from_docx(file_path)
@@ -330,35 +329,33 @@ def process_document(update_data: dict):
             
             edit_message(chat_id, status_message_id, "🤖 Создаю пересказ серии...")
             
-            # Создаем пересказ
             logger.info("Creating episode summary...")
             summary = call_huggingface_api(episode_text, file_name)
             
-            # Удаляем статусное сообщение
             delete_message(chat_id, status_message_id)
             
-            # Отправляем результат
             send_message(chat_id, summary, parse_mode="Markdown", reply_to_message_id=message_id)
             
-            logger.info("Successfully created episode summary")
+            # ИЗМЕНЕНИЕ 2: Логирование успеха перенесено сюда, в конец блока try
+            logger.info(f"Successfully created and sent summary for {file_name}")
             
         except Exception as e:
             logger.error(f"Error processing file {file_name}: {e}")
-            edit_message(
-                chat_id,
-                status_message_id,
-                f"❌ Ошибка при обработке файла: {str(e)}\n"
-                "Убедитесь, что файл содержит диалоги в формате [Персонаж]: текст"
-            )
+            if chat_id and status_message_id:
+                edit_message(
+                    chat_id,
+                    status_message_id,
+                    f"❌ Ошибка при обработке файла: {str(e)}\n"
+                    "Убедитесь, что файл содержит диалоги в формате [Персонаж]: текст"
+                )
         finally:
-            # Удаляем временный файл
             if os.path.exists(file_path):
                 try:
                     os.remove(file_path)
-                    logger.info("Temporary file removed")
+                    logger.info(f"Temporary file removed: {file_path}")
                 except Exception as e:
-                    logger.error(f"Error removing temp file: {e}")
-    
+                    logger.error(f"Error removing temp file {file_path}: {e}")
+                    
     except Exception as e:
         logger.error(f"Unexpected error in process_document: {e}")
 
@@ -384,9 +381,8 @@ def webhook_handler():
     """Обработчик вебхука"""
     try:
         update_json = request.get_json(force=True)
-        logger.info(f"Received webhook update: {update_json}")
+        logger.info(f"Received webhook update: {json.dumps(update_json, indent=2)}")
         
-        # Проверяем, есть ли документ в сообщении
         has_document = False
         if 'message' in update_json and 'document' in update_json['message']:
             has_document = True
@@ -394,10 +390,8 @@ def webhook_handler():
             has_document = True
         
         if has_document:
-            # Обрабатываем документ в отдельном потоке
             executor.submit(process_document, update_json)
         elif 'message' in update_json and update_json['message'].get('text', '').startswith('/start'):
-            # Обрабатываем команду /start
             message_data = update_json['message']
             chat_id = message_data['chat']['id']
             
@@ -429,15 +423,13 @@ def main():
     """Главная функция"""
     port = int(os.environ.get('PORT', 10000))
 
-    # Настраиваем вебхук
     logger.info("Setting up webhook...")
     if not setup_webhook():
         logger.error("Failed to set up webhook")
         sys.exit(1)
 
-    # Запускаем Flask-приложение
     logger.info(f"Starting Flask server on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=port, debug=False)
 
 if __name__ == '__main__':
     main()
