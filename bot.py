@@ -6,13 +6,9 @@ import urllib.request
 import urllib.parse
 import urllib.error
 from flask import Flask, request, jsonify
-from telegram import Update, Bot
-from telegram.constants import ChatAction, ParseMode
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 from docx import Document
 import threading
 from concurrent.futures import ThreadPoolExecutor
-import time
 
 # Настройка логирования
 logging.basicConfig(
@@ -43,119 +39,10 @@ if not WEBHOOK_URL:
 # Создаем базовый URL для API
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-def send_message_sync(chat_id: int, text: str, parse_mode=None, reply_to_message_id=None):
-    """Синхронная отправка сообщения через HTTP API"""
-    try:
-        url = f"{TELEGRAM_API_BASE}/sendMessage"
-        
-        data = {
-            "chat_id": chat_id,
-            "text": text
-        }
-        
-        if parse_mode:
-            data["parse_mode"] = parse_mode
-        if reply_to_message_id:
-            data["reply_to_message_id"] = reply_to_message_id
-        
-        # Кодируем данные для POST запроса
-        post_data = urllib.parse.urlencode(data).encode('utf-8')
-        
-        req = urllib.request.Request(url, data=post_data)
-        req.add_header('Content-Type', 'application/x-www-form-urlencoded')
-        
-        with urllib.request.urlopen(req, timeout=10) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            if result.get('ok'):
-                return result['result']
-            else:
-                logger.error(f"Telegram API error: {result}")
-                return None
-                
-    except Exception as e:
-        logger.error(f"Error sending message: {e}")
-        return None
+# Thread pool для обработки файлов
+executor = ThreadPoolExecutor(max_workers=3)
 
-def edit_message_sync(chat_id: int, message_id: int, text: str, parse_mode=None):
-    """Синхронное редактирование сообщения через HTTP API"""
-    try:
-        url = f"{TELEGRAM_API_BASE}/editMessageText"
-        
-        data = {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": text
-        }
-        
-        if parse_mode:
-            data["parse_mode"] = parse_mode
-        
-        post_data = urllib.parse.urlencode(data).encode('utf-8')
-        
-        req = urllib.request.Request(url, data=post_data)
-        req.add_header('Content-Type', 'application/x-www-form-urlencoded')
-        
-        with urllib.request.urlopen(req, timeout=10) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            return result.get('ok', False)
-                
-    except Exception as e:
-        logger.error(f"Error editing message: {e}")
-        return False
-
-def delete_message_sync(chat_id: int, message_id: int):
-    """Синхронное удаление сообщения через HTTP API"""
-    try:
-        url = f"{TELEGRAM_API_BASE}/deleteMessage"
-        
-        data = {
-            "chat_id": chat_id,
-            "message_id": message_id
-        }
-        
-        post_data = urllib.parse.urlencode(data).encode('utf-8')
-        
-        req = urllib.request.Request(url, data=post_data)
-        req.add_header('Content-Type', 'application/x-www-form-urlencoded')
-        
-        with urllib.request.urlopen(req, timeout=10) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            return result.get('ok', False)
-                
-    except Exception as e:
-        logger.error(f"Error deleting message: {e}")
-        return False
-
-def download_file_sync(file_id: str, file_path: str):
-    """Синхронная загрузка файла через HTTP API"""
-    try:
-        # Сначала получаем информацию о файле
-        url = f"{TELEGRAM_API_BASE}/getFile"
-        data = urllib.parse.urlencode({"file_id": file_id}).encode('utf-8')
-        
-        req = urllib.request.Request(url, data=data)
-        req.add_header('Content-Type', 'application/x-www-form-urlencoded')
-        
-        with urllib.request.urlopen(req, timeout=10) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            
-            if not result.get('ok'):
-                logger.error(f"Failed to get file info: {result}")
-                return False
-            
-            file_info = result['result']
-            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info['file_path']}"
-            
-            # Загружаем файл
-            with urllib.request.urlopen(file_url, timeout=30) as file_response:
-                with open(file_path, 'wb') as f:
-                    f.write(file_response.read())
-            
-            return True
-                
-    except Exception as e:
-        logger.error(f"Error downloading file: {e}")
-        return False
+def prepare_episode_text(text: str) -> str:
     lines = text.split('\n')
     cleaned_lines = []
     
@@ -173,89 +60,6 @@ def download_file_sync(file_id: str, file_path: str):
         episode_text = episode_text[:quarter*3] + "..." + episode_text[-quarter:]
     
     return episode_text
-
-def summarize_episode_with_huggingface_sync(episode_text: str, file_name: str) -> str:
-    """Синхронная версия функции для вызова API"""
-    try:
-        prompt = f"""Создай краткий пересказ этой серии на основе диалогов персонажей.
-        
-ВАЖНЫЕ ТРЕБОВАНИЯ:
-- Используй ТОЛЬКО информацию из предоставленного текста
-- НЕ добавляй ничего от себя
-- Сосредоточься на главных событиях серии
-- Упоминай имена персонажей из квадратных скобок
-- Пересказ должен читаться за 2 минуты
-- Не описывай мелкие детали
-
-Текст серии:
-{episode_text}
-
-Краткий пересказ основных событий серии:"""
-
-        api_url = f"https://api-inference.huggingface.co/models/{HUGGINGFACE_MODEL}"
-        
-        headers = {
-            "Authorization": f"Bearer {HUGGINGFACE_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "inputs": prompt,
-            "parameters": {
-                "max_length": 300,
-                "min_length": 100,
-                "do_sample": False,
-                "temperature": 0.3,
-                "repetition_penalty": 1.1
-            }
-        }
-        
-        # Подготавливаем данные для запроса
-        data = json.dumps(payload).encode('utf-8')
-        
-        # Создаем запрос
-        req = urllib.request.Request(api_url, data=data, headers=headers)
-        
-        try:
-            with urllib.request.urlopen(req, timeout=30) as response:
-                if response.status == 200:
-                    result = json.loads(response.read().decode('utf-8'))
-                    if isinstance(result, list) and len(result) > 0:
-                        summary = result[0].get('summary_text', '')
-                        if not summary:
-                            summary = result[0].get('generated_text', '')
-                            if prompt in summary:
-                                summary = summary.replace(prompt, '').strip()
-                        
-                        if summary:
-                            return format_episode_summary(summary, file_name)
-                        else:
-                            return "❌ Модель не смогла создать пересказ"
-                    else:
-                        return "❌ Неожиданный формат ответа от API"
-                elif response.status == 503:
-                    return "⏳ Модель загружается, попробуйте через 1-2 минуты"
-                elif response.status == 429:
-                    return "⏳ Превышены лимиты API, попробуйте позже"
-                else:
-                    error_text = response.read().decode('utf-8')
-                    logger.error(f"Hugging Face API error: {response.status} - {error_text}")
-                    return f"❌ Ошибка API: {response.status}"
-        except urllib.error.HTTPError as e:
-            if e.code == 503:
-                return "⏳ Модель загружается, попробуйте через 1-2 минуты"
-            elif e.code == 429:
-                return "⏳ Превышены лимиты API, попробуйте позже"
-            else:
-                logger.error(f"HTTP Error: {e.code} - {e.reason}")
-                return f"❌ Ошибка API: {e.code}"
-    
-    except urllib.error.URLError as e:
-        logger.error(f"URL Error calling Hugging Face API: {e}")
-        return "⏳ Ошибка соединения, попробуйте еще раз"
-    except Exception as e:
-        logger.error(f"Error calling Hugging Face API: {e}")
-        return f"❌ Ошибка при обращении к API: {str(e)}"
 
 def format_episode_summary(summary: str, file_name: str) -> str:
     episode_name = file_name.replace('.srt', '').replace('.docx', '')
@@ -306,16 +110,153 @@ def extract_text_from_srt(file_path: str) -> str:
         logger.error(f"Error extracting text from SRT: {e}")
         raise e
 
-# Thread pool для обработки файлов
-executor = ThreadPoolExecutor(max_workers=3)
-
-# Функции для обработки текста и API
-def prepare_episode_text(text: str) -> str:
-
-def process_document_sync(update_data: dict):
-    """Синхронная обработка документа"""
+def send_telegram_request(method: str, data: dict):
+    """Универсальная функция для отправки запросов к Telegram API"""
     try:
-        logger.info("Processing document synchronously")
+        url = f"{TELEGRAM_API_BASE}/{method}"
+        post_data = urllib.parse.urlencode(data).encode('utf-8')
+        
+        req = urllib.request.Request(url, data=post_data)
+        req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            return result
+            
+    except Exception as e:
+        logger.error(f"Error in Telegram API request {method}: {e}")
+        return None
+
+def send_message(chat_id: int, text: str, parse_mode=None, reply_to_message_id=None):
+    """Отправка сообщения"""
+    data = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        data["parse_mode"] = parse_mode
+    if reply_to_message_id:
+        data["reply_to_message_id"] = reply_to_message_id
+    
+    result = send_telegram_request("sendMessage", data)
+    if result and result.get('ok'):
+        return result['result']
+    return None
+
+def edit_message(chat_id: int, message_id: int, text: str, parse_mode=None):
+    """Редактирование сообщения"""
+    data = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if parse_mode:
+        data["parse_mode"] = parse_mode
+    
+    result = send_telegram_request("editMessageText", data)
+    return result and result.get('ok', False)
+
+def delete_message(chat_id: int, message_id: int):
+    """Удаление сообщения"""
+    data = {"chat_id": chat_id, "message_id": message_id}
+    result = send_telegram_request("deleteMessage", data)
+    return result and result.get('ok', False)
+
+def download_file(file_id: str, file_path: str):
+    """Загрузка файла"""
+    try:
+        # Получаем информацию о файле
+        data = {"file_id": file_id}
+        result = send_telegram_request("getFile", data)
+        
+        if not result or not result.get('ok'):
+            logger.error(f"Failed to get file info: {result}")
+            return False
+        
+        file_info = result['result']
+        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info['file_path']}"
+        
+        # Загружаем файл
+        with urllib.request.urlopen(file_url, timeout=30) as response:
+            with open(file_path, 'wb') as f:
+                f.write(response.read())
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error downloading file: {e}")
+        return False
+
+def call_huggingface_api(episode_text: str, file_name: str) -> str:
+    """Вызов API Hugging Face"""
+    try:
+        prompt = f"""Создай краткий пересказ этой серии на основе диалогов персонажей.
+        
+ВАЖНЫЕ ТРЕБОВАНИЯ:
+- Используй ТОЛЬКО информацию из предоставленного текста
+- НЕ добавляй ничего от себя
+- Сосредоточься на главных событиях серии
+- Упоминай имена персонажей из квадратных скобок
+- Пересказ должен читаться за 2 минуты
+- Не описывай мелкие детали
+
+Текст серии:
+{episode_text}
+
+Краткий пересказ основных событий серии:"""
+
+        api_url = f"https://api-inference.huggingface.co/models/{HUGGINGFACE_MODEL}"
+        
+        headers = {
+            "Authorization": f"Bearer {HUGGINGFACE_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_length": 300,
+                "min_length": 100,
+                "do_sample": False,
+                "temperature": 0.3,
+                "repetition_penalty": 1.1
+            }
+        }
+        
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(api_url, data=data, headers=headers)
+        
+        with urllib.request.urlopen(req, timeout=30) as response:
+            if response.status == 200:
+                result = json.loads(response.read().decode('utf-8'))
+                if isinstance(result, list) and len(result) > 0:
+                    summary = result[0].get('summary_text', '')
+                    if not summary:
+                        summary = result[0].get('generated_text', '')
+                        if prompt in summary:
+                            summary = summary.replace(prompt, '').strip()
+                    
+                    if summary:
+                        return format_episode_summary(summary, file_name)
+                    else:
+                        return "❌ Модель не смогла создать пересказ"
+                else:
+                    return "❌ Неожиданный формат ответа от API"
+            elif response.status == 503:
+                return "⏳ Модель загружается, попробуйте через 1-2 минуты"
+            elif response.status == 429:
+                return "⏳ Превышены лимиты API, попробуйте позже"
+            else:
+                return f"❌ Ошибка API: {response.status}"
+    
+    except urllib.error.HTTPError as e:
+        if e.code == 503:
+            return "⏳ Модель загружается, попробуйте через 1-2 минуты"
+        elif e.code == 429:
+            return "⏳ Превышены лимиты API, попробуйте позже"
+        else:
+            return f"❌ Ошибка API: {e.code}"
+    except Exception as e:
+        logger.error(f"Error calling Hugging Face API: {e}")
+        return f"❌ Ошибка при обращении к API: {str(e)}"
+
+def process_document(update_data: dict):
+    """Обработка документа"""
+    try:
+        logger.info("Processing document")
         
         # Получаем данные из update
         if 'message' in update_data:
@@ -340,12 +281,14 @@ def process_document_sync(update_data: dict):
         
         logger.info(f"Processing file: {file_name}, size: {file_size} bytes")
         
+        # Проверяем размер файла
         if file_size > 20 * 1024 * 1024:
-            send_message_sync(chat_id, "❌ Файл слишком большой (максимум 20MB)")
+            send_message(chat_id, "❌ Файл слишком большой (максимум 20MB)")
             return
         
+        # Проверяем расширение файла
         if not (file_name.lower().endswith('.docx') or file_name.lower().endswith('.srt')):
-            send_message_sync(
+            send_message(
                 chat_id,
                 "❌ Поддерживаются только файлы .srt (субтитры) и .docx (документы)\n"
                 "Отправьте файл субтитров с диалогами персонажей."
@@ -353,7 +296,7 @@ def process_document_sync(update_data: dict):
             return
         
         # Отправляем статусное сообщение
-        status_response = send_message_sync(chat_id, "🔄 Анализирую диалоги персонажей...")
+        status_response = send_message(chat_id, "🔄 Анализирую диалоги персонажей...")
         if not status_response:
             logger.error("Failed to send status message")
             return
@@ -364,8 +307,8 @@ def process_document_sync(update_data: dict):
         try:
             # Загружаем файл
             logger.info("Downloading file...")
-            if not download_file_sync(file_id, file_path):
-                edit_message_sync(chat_id, status_message_id, "❌ Ошибка при загрузке файла")
+            if not download_file(file_id, file_path):
+                edit_message(chat_id, status_message_id, "❌ Ошибка при загрузке файла")
                 return
             
             # Извлекаем текст
@@ -376,43 +319,39 @@ def process_document_sync(update_data: dict):
                 raw_text = extract_text_from_srt(file_path)
             
             if not raw_text or not raw_text.strip():
-                edit_message_sync(chat_id, status_message_id, "❌ Файл не содержит диалогов персонажей")
+                edit_message(chat_id, status_message_id, "❌ Файл не содержит диалогов персонажей")
                 return
             
             episode_text = prepare_episode_text(raw_text)
             
             if not episode_text or len(episode_text) < 100:
-                edit_message_sync(chat_id, status_message_id, "❌ Недостаточно диалогов для создания пересказа")
+                edit_message(chat_id, status_message_id, "❌ Недостаточно диалогов для создания пересказа")
                 return
             
-            edit_message_sync(chat_id, status_message_id, "🤖 Создаю пересказ серии...")
+            edit_message(chat_id, status_message_id, "🤖 Создаю пересказ серии...")
             
             # Создаем пересказ
             logger.info("Creating episode summary...")
-            summary = summarize_episode_with_huggingface_sync(episode_text, file_name)
+            summary = call_huggingface_api(episode_text, file_name)
             
             # Удаляем статусное сообщение
-            delete_message_sync(chat_id, status_message_id)
+            delete_message(chat_id, status_message_id)
             
             # Отправляем результат
-            send_message_sync(
-                chat_id,
-                summary,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_to_message_id=message_id
-            )
+            send_message(chat_id, summary, parse_mode="Markdown", reply_to_message_id=message_id)
             
             logger.info("Successfully created episode summary")
             
         except Exception as e:
             logger.error(f"Error processing file {file_name}: {e}")
-            edit_message_sync(
+            edit_message(
                 chat_id,
                 status_message_id,
                 f"❌ Ошибка при обработке файла: {str(e)}\n"
                 "Убедитесь, что файл содержит диалоги в формате [Персонаж]: текст"
             )
         finally:
+            # Удаляем временный файл
             if os.path.exists(file_path):
                 try:
                     os.remove(file_path)
@@ -421,29 +360,21 @@ def process_document_sync(update_data: dict):
                     logger.error(f"Error removing temp file: {e}")
     
     except Exception as e:
-        logger.error(f"Unexpected error in process_document_sync: {e}")
+        logger.error(f"Unexpected error in process_document: {e}")
 
-def setup_webhook_sync():
-    """Синхронная настройка вебхука"""
+def setup_webhook():
+    """Настройка вебхука"""
     try:
         webhook_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
-        url = f"{TELEGRAM_API_BASE}/setWebhook"
+        data = {"url": webhook_url}
+        result = send_telegram_request("setWebhook", data)
         
-        data = urllib.parse.urlencode({"url": webhook_url}).encode('utf-8')
-        
-        req = urllib.request.Request(url, data=data)
-        req.add_header('Content-Type', 'application/x-www-form-urlencoded')
-        
-        with urllib.request.urlopen(req, timeout=10) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            
-            if result.get('ok'):
-                logger.info(f"Webhook set to {webhook_url}")
-                return True
-            else:
-                logger.error(f"Failed to set webhook: {result}")
-                return False
-                
+        if result and result.get('ok'):
+            logger.info(f"Webhook set to {webhook_url}")
+            return True
+        else:
+            logger.error(f"Failed to set webhook: {result}")
+            return False
     except Exception as e:
         logger.error(f"Error setting webhook: {e}")
         return False
@@ -464,7 +395,7 @@ def webhook_handler():
         
         if has_document:
             # Обрабатываем документ в отдельном потоке
-            executor.submit(process_document_sync, update_json)
+            executor.submit(process_document, update_json)
         elif 'message' in update_json and update_json['message'].get('text', '').startswith('/start'):
             # Обрабатываем команду /start
             message_data = update_json['message']
@@ -482,7 +413,7 @@ def webhook_handler():
 
 Просто отправьте файл и ждите пересказ!"""
             
-            send_message_sync(chat_id, welcome_message, parse_mode=ParseMode.MARKDOWN)
+            send_message(chat_id, welcome_message, parse_mode="Markdown")
         
         return "ok"
     except Exception as e:
@@ -495,12 +426,12 @@ def health_check():
     return "Bot is running!"
 
 def main():
-    """Главная функция для запуска Flask-сервера и настройки вебхука"""
+    """Главная функция"""
     port = int(os.environ.get('PORT', 10000))
 
     # Настраиваем вебхук
     logger.info("Setting up webhook...")
-    if not setup_webhook_sync():
+    if not setup_webhook():
         logger.error("Failed to set up webhook")
         sys.exit(1)
 
