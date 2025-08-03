@@ -1,12 +1,13 @@
 import logging
 import os
-from telegram import Update
+from telegram import Bot, Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+bot = Bot(BOT_TOKEN)
 
 async def summarize_text(text: str) -> str:
     return f"Сводка:\n{text[:500]}..."
@@ -48,7 +49,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(file_path)
 
 def main():
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application(bot=bot)
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.run_polling()
 
