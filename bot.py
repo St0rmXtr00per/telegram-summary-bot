@@ -8,6 +8,7 @@ from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 from docx import Document
+import threading
 
 # Настройка логирования
 logging.basicConfig(
@@ -34,6 +35,9 @@ if not HUGGINGFACE_API_KEY:
 if not WEBHOOK_URL:
     logger.error("WEBHOOK_URL environment variable is not set!")
     sys.exit(1)
+
+# Глобальная переменная для хранения application
+application = None
 
 # Функции для обработки текста и API (без изменений)
 def prepare_episode_text(text: str) -> str:
@@ -277,44 +281,92 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-# Инициализация бота
-application = ApplicationBuilder().token(BOT_TOKEN).build()
+def run_async_task(coro):
+    """Функция для запуска асинхронных задач в синхронном контексте"""
+    try:
+        # Пытаемся использовать существующий цикл событий
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Если цикл уже запущен, создаем новый поток
+            result = asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=30)
+            return result
+        else:
+            return loop.run_until_complete(coro)
+    except RuntimeError:
+        # Если нет активного цикла, создаем новый
+        return asyncio.run(coro)
 
-# Добавляем обработчики
-application.add_handler(CommandHandler("start", start_command))
-application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+async def init_application():
+    """Инициализация приложения"""
+    global application
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Добавляем обработчики
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
+    # Инициализация приложения
+    await application.initialize()
+    return application
 
 async def setup_webhook():
-    """Настройка вебхука и инициализация приложения"""
+    """Настройка вебхука"""
+    global application
+    if application is None:
+        application = await init_application()
+    
     await application.bot.set_webhook(f"{WEBHOOK_URL}/{BOT_TOKEN}")
     logger.info(f"Webhook set to {WEBHOOK_URL}/{BOT_TOKEN}")
 
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
-async def webhook_handler():
+def webhook_handler():
+    """Синхронный обработчик вебхука"""
     try:
         update_json = request.get_json(force=True)
-        # Инициализация здесь нужна, так как Flask запускает новый цикл событий
-        # при каждом запросе
-        await application.initialize() 
+        logger.info(f"Received webhook update: {update_json}")
+        
+        global application
+        if application is None:
+            logger.error("Application not initialized")
+            return "error", 500
+        
         update = Update.de_json(update_json, application.bot)
-        await application.process_update(update)
+        
+        # Запускаем асинхронную обработку в отдельном потоке
+        def process_update():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(application.process_update(update))
+                loop.close()
+            except Exception as e:
+                logger.error(f"Error in update processing thread: {e}")
+        
+        thread = threading.Thread(target=process_update)
+        thread.daemon = True
+        thread.start()
+        
         return "ok"
     except Exception as e:
         logger.error(f"Error processing webhook update: {e}")
         return "error", 500
 
+@app.route("/", methods=["GET"])
+def health_check():
+    """Проверка работоспособности"""
+    return "Bot is running!"
+
 def main():
     """Главная функция для запуска Flask-сервера и настройки вебхука"""
     port = int(os.environ.get('PORT', 10000))
 
-    # Сначала настраиваем вебхук
-    # Мы не используем asyncio.run здесь, чтобы не создавать конфликт
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(setup_webhook())
+    # Инициализируем приложение и настраиваем вебхук
+    logger.info("Initializing application and setting up webhook...")
+    asyncio.run(setup_webhook())
 
-    # Затем запускаем Flask-приложение
+    # Запускаем Flask-приложение
     logger.info(f"Starting Flask server on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
 
 if __name__ == '__main__':
     main()
