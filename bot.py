@@ -2,7 +2,7 @@ import logging
 import os
 import sys
 import asyncio
-import aiohttp
+import requests
 from threading import Thread
 from flask import Flask, jsonify
 from telegram import Update
@@ -104,37 +104,47 @@ async def summarize_episode_with_huggingface(episode_text: str, file_name: str) 
             }
         }
         
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.post(api_url, headers=headers, json=payload) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    if isinstance(result, list) and len(result) > 0:
-                        summary = result[0].get('summary_text', '')
-                        if not summary:
-                            # Пробуем получить generated_text если summary_text пустой
-                            summary = result[0].get('generated_text', '')
-                            # Убираем исходный промпт из ответа
-                            if prompt in summary:
-                                summary = summary.replace(prompt, '').strip()
-                        
-                        if summary:
-                            return format_episode_summary(summary, file_name)
-                        else:
-                            return "❌ Модель не смогла создать пересказ"
-                    else:
-                        return "❌ Неожиданный формат ответа от API"
-                elif response.status == 503:
-                    return "⏳ Модель загружается, попробуйте через 1-2 минуты"
-                elif response.status == 429:
-                    return "⏳ Превышены лимиты API, попробуйте позже"
+        # Выполняем запрос в отдельном потоке чтобы не блокировать async
+        def make_request():
+            try:
+                response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+                return response
+            except Exception as e:
+                logger.error(f"Request error: {e}")
+                return None
+        
+        # Запускаем в executor для неблокирующего выполнения
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, make_request)
+        
+        if response is None:
+            return "❌ Ошибка соединения с API"
+        
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list) and len(result) > 0:
+                summary = result[0].get('summary_text', '')
+                if not summary:
+                    # Пробуем получить generated_text если summary_text пустой
+                    summary = result[0].get('generated_text', '')
+                    # Убираем исходный промпт из ответа
+                    if prompt in summary:
+                        summary = summary.replace(prompt, '').strip()
+                
+                if summary:
+                    return format_episode_summary(summary, file_name)
                 else:
-                    error_text = await response.text()
-                    logger.error(f"Hugging Face API error: {response.status} - {error_text}")
-                    return f"❌ Ошибка API: {response.status}"
+                    return "❌ Модель не смогла создать пересказ"
+            else:
+                return "❌ Неожиданный формат ответа от API"
+        elif response.status_code == 503:
+            return "⏳ Модель загружается, попробуйте через 1-2 минуты"
+        elif response.status_code == 429:
+            return "⏳ Превышены лимиты API, попробуйте позже"
+        else:
+            logger.error(f"Hugging Face API error: {response.status_code} - {response.text}")
+            return f"❌ Ошибка API: {response.status_code}"
     
-    except asyncio.TimeoutError:
-        logger.error("Timeout calling Hugging Face API")
-        return "⏳ Таймаут API, попробуйте еще раз"
     except Exception as e:
         logger.error(f"Error calling Hugging Face API: {e}")
         return f"❌ Ошибка при обращении к API: {str(e)}"
