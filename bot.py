@@ -328,7 +328,7 @@ def run_flask_app():
     # use_reloader=False - чтобы избежать двойного запуска в режиме отладки
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
-async def run_bot_async():
+async def run_bot_async(loop):
     """Асинхронный запуск Telegram бота"""
     try:
         logger.info("Starting Telegram bot...")
@@ -348,8 +348,14 @@ async def run_bot_async():
         
     except Exception as e:
         logger.error(f"Failed to start bot: {e}")
-        # Выходим из приложения, если бот не запустился
-        os._exit(1)
+        # Завершаем цикл, если бот не запустился
+        loop.stop()
+
+def start_bot_thread():
+    """Запуск бота в отдельном потоке с асинхронным циклом"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(run_bot_async(loop))
 
 def main():
     """Главная функция"""
@@ -359,11 +365,13 @@ def main():
     flask_thread = Thread(target=run_flask_app, daemon=True)
     flask_thread.start()
 
-    # Даем Flask немного времени на запуск перед запуском бота
-    time.sleep(5) 
+    # Запускаем бота в отдельном потоке, чтобы не блокировать основной
+    bot_thread = Thread(target=start_bot_thread, daemon=True)
+    bot_thread.start()
 
-    # Запускаем бота в основном асинхронном цикле
-    asyncio.run(run_bot_async())
+    # Просто держим главный поток живым, пока работают другие
+    while True:
+        time.sleep(1)
 
 if __name__ == '__main__':
     main()
