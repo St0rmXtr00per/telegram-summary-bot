@@ -1,9 +1,10 @@
 import logging
 import os
 import sys
-import asyncio
-import aiohttp
-import requests
+import json
+import urllib.request
+import urllib.parse
+import urllib.error
 from flask import Flask, request, jsonify
 from telegram import Update, Bot
 from telegram.constants import ChatAction, ParseMode
@@ -101,34 +102,49 @@ def summarize_episode_with_huggingface_sync(episode_text: str, file_name: str) -
             }
         }
         
-        response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+        # Подготавливаем данные для запроса
+        data = json.dumps(payload).encode('utf-8')
         
-        if response.status_code == 200:
-            result = response.json()
-            if isinstance(result, list) and len(result) > 0:
-                summary = result[0].get('summary_text', '')
-                if not summary:
-                    summary = result[0].get('generated_text', '')
-                    if prompt in summary:
-                        summary = summary.replace(prompt, '').strip()
-                
-                if summary:
-                    return format_episode_summary(summary, file_name)
+        # Создаем запрос
+        req = urllib.request.Request(api_url, data=data, headers=headers)
+        
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                if response.status == 200:
+                    result = json.loads(response.read().decode('utf-8'))
+                    if isinstance(result, list) and len(result) > 0:
+                        summary = result[0].get('summary_text', '')
+                        if not summary:
+                            summary = result[0].get('generated_text', '')
+                            if prompt in summary:
+                                summary = summary.replace(prompt, '').strip()
+                        
+                        if summary:
+                            return format_episode_summary(summary, file_name)
+                        else:
+                            return "❌ Модель не смогла создать пересказ"
+                    else:
+                        return "❌ Неожиданный формат ответа от API"
+                elif response.status == 503:
+                    return "⏳ Модель загружается, попробуйте через 1-2 минуты"
+                elif response.status == 429:
+                    return "⏳ Превышены лимиты API, попробуйте позже"
                 else:
-                    return "❌ Модель не смогла создать пересказ"
+                    error_text = response.read().decode('utf-8')
+                    logger.error(f"Hugging Face API error: {response.status} - {error_text}")
+                    return f"❌ Ошибка API: {response.status}"
+        except urllib.error.HTTPError as e:
+            if e.code == 503:
+                return "⏳ Модель загружается, попробуйте через 1-2 минуты"
+            elif e.code == 429:
+                return "⏳ Превышены лимиты API, попробуйте позже"
             else:
-                return "❌ Неожиданный формат ответа от API"
-        elif response.status_code == 503:
-            return "⏳ Модель загружается, попробуйте через 1-2 минуты"
-        elif response.status_code == 429:
-            return "⏳ Превышены лимиты API, попробуйте позже"
-        else:
-            logger.error(f"Hugging Face API error: {response.status_code} - {response.text}")
-            return f"❌ Ошибка API: {response.status_code}"
+                logger.error(f"HTTP Error: {e.code} - {e.reason}")
+                return f"❌ Ошибка API: {e.code}"
     
-    except requests.exceptions.Timeout:
-        logger.error("Timeout calling Hugging Face API")
-        return "⏳ Таймаут API, попробуйте еще раз"
+    except urllib.error.URLError as e:
+        logger.error(f"URL Error calling Hugging Face API: {e}")
+        return "⏳ Ошибка соединения, попробуйте еще раз"
     except Exception as e:
         logger.error(f"Error calling Hugging Face API: {e}")
         return f"❌ Ошибка при обращении к API: {str(e)}"
