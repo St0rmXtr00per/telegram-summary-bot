@@ -311,13 +311,6 @@ async def init_application():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
-    # Добавляем поддержку обработки документов в каналах
-    from telegram.ext import MessageHandler
-    # Создаем отдельный фильтр для channel_post
-    channel_document_handler = MessageHandler(filters.Document.ALL, handle_document)
-    channel_document_handler.check_update = lambda update: update.channel_post and update.channel_post.document
-    application.add_handler(channel_document_handler)
-    
     # Инициализация приложения
     await application.initialize()
     return application
