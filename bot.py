@@ -6,7 +6,7 @@ import aiohttp
 from threading import Thread
 from flask import Flask, jsonify
 from telegram import Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 
 # Добавим отладку версии Python
@@ -32,8 +32,8 @@ def index():
 
 # Получение токенов и настроек
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")  # Добавьте это в Render
-HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "facebook/bart-large-cnn")  # Модель по умолчанию
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "facebook/bart-large-cnn")
 
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN environment variable is not set!")
@@ -43,10 +43,49 @@ if not HUGGINGFACE_API_KEY:
     logger.error("HUGGINGFACE_API_KEY environment variable is not set!")
     sys.exit(1)
 
-async def summarize_with_huggingface(text: str) -> str:
-    """Суммаризация текста через Hugging Face API"""
+def prepare_episode_text(text: str) -> str:
+    """Подготавливает текст серии для анализа"""
+    lines = text.split('\n')
+    cleaned_lines = []
+    
+    for line in lines:
+        line = line.strip()
+        if line and '[' in line and ']' in line:
+            # Убираем временные метки и нумерацию субтитров
+            if '-->' not in line and not line.isdigit():
+                cleaned_lines.append(line)
+    
+    # Соединяем диалоги в читаемый текст
+    episode_text = ' '.join(cleaned_lines)
+    
+    # Ограничиваем длину для API (оставляем место для промпта)
+    max_chars = 3000
+    if len(episode_text) > max_chars:
+        # Берем начало и конец серии, чтобы сохранить контекст
+        quarter = max_chars // 4
+        episode_text = episode_text[:quarter*3] + "..." + episode_text[-quarter:]
+    
+    return episode_text
+
+async def summarize_episode_with_huggingface(episode_text: str, file_name: str) -> str:
+    """Создание краткого пересказа серии через Hugging Face API"""
     try:
-        # URL API Hugging Face
+        # Создаем специальный промпт для пересказа серии
+        prompt = f"""Создай краткий пересказ этой серии на основе диалогов персонажей. 
+        
+ВАЖНЫЕ ТРЕБОВАНИЯ:
+- Используй ТОЛЬКО информацию из предоставленного текста
+- НЕ добавляй ничего от себя
+- Сосредоточься на главных событиях серии
+- Упоминай имена персонажей из квадратных скобок
+- Пересказ должен читаться за 2 минуты
+- Не описывай мелкие детали
+
+Текст серии:
+{episode_text}
+
+Краткий пересказ основных событий серии:"""
+
         api_url = f"https://api-inference.huggingface.co/models/{HUGGINGFACE_MODEL}"
         
         headers = {
@@ -54,41 +93,65 @@ async def summarize_with_huggingface(text: str) -> str:
             "Content-Type": "application/json"
         }
         
-        # Ограничиваем длину текста (модели имеют лимиты)
-        max_length = 1024  # Для BART
-        if len(text) > max_length:
-            # Берем начало и конец текста
-            half = max_length // 2
-            text = text[:half] + "..." + text[-half:]
-        
         payload = {
-            "inputs": text,
+            "inputs": prompt,
             "parameters": {
-                "max_length": 150,
-                "min_length": 30,
-                "do_sample": False
+                "max_length": 300,  # Увеличиваем для более подробного пересказа
+                "min_length": 100,
+                "do_sample": False,
+                "temperature": 0.3,  # Низкая температура для точности
+                "repetition_penalty": 1.1
             }
         }
         
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
             async with session.post(api_url, headers=headers, json=payload) as response:
                 if response.status == 200:
                     result = await response.json()
                     if isinstance(result, list) and len(result) > 0:
-                        summary = result[0].get('summary_text', 'Не удалось получить резюме')
-                        return f"📄 **Краткое содержание:**\n\n{summary}"
+                        summary = result[0].get('summary_text', '')
+                        if not summary:
+                            # Пробуем получить generated_text если summary_text пустой
+                            summary = result[0].get('generated_text', '')
+                            # Убираем исходный промпт из ответа
+                            if prompt in summary:
+                                summary = summary.replace(prompt, '').strip()
+                        
+                        if summary:
+                            return format_episode_summary(summary, file_name)
+                        else:
+                            return "❌ Модель не смогла создать пересказ"
                     else:
                         return "❌ Неожиданный формат ответа от API"
                 elif response.status == 503:
-                    return "⏳ Модель загружается, попробуйте через минуту"
+                    return "⏳ Модель загружается, попробуйте через 1-2 минуты"
+                elif response.status == 429:
+                    return "⏳ Превышены лимиты API, попробуйте позже"
                 else:
                     error_text = await response.text()
                     logger.error(f"Hugging Face API error: {response.status} - {error_text}")
                     return f"❌ Ошибка API: {response.status}"
     
+    except asyncio.TimeoutError:
+        logger.error("Timeout calling Hugging Face API")
+        return "⏳ Таймаут API, попробуйте еще раз"
     except Exception as e:
         logger.error(f"Error calling Hugging Face API: {e}")
         return f"❌ Ошибка при обращении к API: {str(e)}"
+
+def format_episode_summary(summary: str, file_name: str) -> str:
+    """Форматирует пересказ для отправки в Telegram со сворачиваемым блоком"""
+    # Убираем название файла из расширения для заголовка
+    episode_name = file_name.replace('.srt', '').replace('.docx', '')
+    
+    # Создаем сворачиваемый блок (spoiler в Telegram)
+    formatted_summary = f"""📺 **Краткий пересказ: {episode_name}**
+
+||{summary.strip()}||
+
+_Пересказ создан на основе диалогов персонажей_"""
+    
+    return formatted_summary
 
 def extract_text_from_docx(file_path: str) -> str:
     """Извлечение текста из DOCX файла"""
@@ -110,20 +173,27 @@ def extract_text_from_docx(file_path: str) -> str:
         raise e
 
 def extract_text_from_srt(file_path: str) -> str:
-    """Извлечение текста из SRT файла"""
+    """Извлечение текста из SRT файла с сохранением структуры диалогов"""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+            content = f.read()
         
-        text_lines = []
-        for line in lines:
-            line = line.strip()
-            # Пропускаем номера субтитров и временные метки
-            if line and not line.isdigit() and '-->' not in line:
-                text_lines.append(line)
+        # Разбиваем на блоки субтитров
+        blocks = content.strip().split('\n\n')
+        dialogue_lines = []
         
-        full_text = ' '.join(text_lines)  # Соединяем пробелами для лучшего чтения
-        logger.info(f"Extracted {len(full_text)} characters from SRT")
+        for block in blocks:
+            lines = block.strip().split('\n')
+            if len(lines) >= 3:  # Номер, время, текст
+                # Берем все строки после времени (может быть многострочный диалог)
+                text_lines = lines[2:]
+                for text_line in text_lines:
+                    text_line = text_line.strip()
+                    if text_line and '[' in text_line and ']' in text_line:
+                        dialogue_lines.append(text_line)
+        
+        full_text = '\n'.join(dialogue_lines)
+        logger.info(f"Extracted {len(dialogue_lines)} dialogue lines from SRT")
         return full_text
         
     except Exception as e:
@@ -132,18 +202,19 @@ def extract_text_from_srt(file_path: str) -> str:
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
-    welcome_message = """
-🤖 **Бот для суммаризации документов**
+    welcome_message = """🎬 **Бот для пересказа серий**
 
-Отправьте мне файл в формате:
-📄 `.docx` - документ Word
-🎬 `.srt` - файл субтитров
+Отправьте мне файл субтитров или документ:
+🎬 `.srt` - файл субтитров с диалогами персонажей
+📄 `.docx` - документ с диалогами в формате [Имя]: текст
 
-Я проанализирую содержимое и создам краткое резюме с помощью ИИ.
+Я создам краткий пересказ основных событий серии на основе диалогов персонажей. Пересказ будет скрыт под спойлер, чтобы не портить впечатление другим.
 
-Просто отправьте файл и ждите результат!
-    """
-    await update.message.reply_text(welcome_message)
+**Важно:** Я использую только информацию из вашего файла и не добавляю ничего от себя.
+
+Просто отправьте файл и ждите пересказ!"""
+    
+    await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик документов"""
@@ -160,7 +231,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         logger.info(f"Processing file: {file_name}, size: {file_size} bytes")
         
-        # Проверяем размер файла (лимит 20MB для Telegram API)
+        # Проверяем размер файла
         if file_size > 20 * 1024 * 1024:
             await update.message.reply_text("❌ Файл слишком большой (максимум 20MB)")
             return
@@ -168,15 +239,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Проверяем поддерживаемые форматы
         if not (file_name.lower().endswith('.docx') or file_name.lower().endswith('.srt')):
             await update.message.reply_text(
-                "❌ Поддерживаются только файлы формата .docx и .srt\n"
-                "Отправьте документ Word или файл субтитров."
+                "❌ Поддерживаются только файлы .srt (субтитры) и .docx (документы)\n"
+                "Отправьте файл субтитров с диалогами персонажей."
             )
             return
         
-        # Уведомляем пользователя о начале обработки
-        await update.message.reply_text("🔄 Обрабатываю файл...")
+        # Уведомляем пользователя
+        status_message = await update.message.reply_text("🔄 Анализирую диалоги персонажей...")
         
-        # Показываем, что бот печатает
+        # Показываем активность
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id, 
             action=ChatAction.TYPING
@@ -191,33 +262,48 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_obj = await file.get_file()
             await file_obj.download_to_drive(file_path)
             
-            # Извлекаем текст в зависимости от типа файла
-            logger.info("Extracting text...")
+            # Извлекаем текст
+            logger.info("Extracting dialogue text...")
             if file_name.lower().endswith('.docx'):
-                text = extract_text_from_docx(file_path)
+                raw_text = extract_text_from_docx(file_path)
             else:  # .srt
-                text = extract_text_from_srt(file_path)
+                raw_text = extract_text_from_srt(file_path)
             
-            if not text or not text.strip():
-                await update.message.reply_text("❌ Файл пустой или не содержит текста")
+            if not raw_text or not raw_text.strip():
+                await status_message.edit_text("❌ Файл не содержит диалогов персонажей")
                 return
             
-            # Показываем прогресс
-            await update.message.reply_text("🤖 Создаю резюме с помощью ИИ...")
+            # Подготавливаем текст для анализа
+            episode_text = prepare_episode_text(raw_text)
             
-            # Создаем сводку через Hugging Face
-            logger.info("Calling Hugging Face API...")
-            summary = await summarize_with_huggingface(text)
+            if not episode_text or len(episode_text) < 100:
+                await status_message.edit_text("❌ Недостаточно диалогов для создания пересказа")
+                return
             
-            # Отправляем результат
-            await update.message.reply_text(summary, parse_mode='Markdown')
-            logger.info("Successfully processed document")
+            # Обновляем статус
+            await status_message.edit_text("🤖 Создаю пересказ серии...")
+            
+            # Создаем пересказ через Hugging Face
+            logger.info("Creating episode summary...")
+            summary = await summarize_episode_with_huggingface(episode_text, file_name)
+            
+            # Удаляем статусное сообщение
+            await status_message.delete()
+            
+            # Отправляем пересказ как ответ на файл
+            await update.message.reply_text(
+                summary, 
+                parse_mode=ParseMode.MARKDOWN,
+                reply_to_message_id=update.message.message_id
+            )
+            
+            logger.info("Successfully created episode summary")
             
         except Exception as e:
             logger.error(f"Error processing file {file_name}: {e}")
-            await update.message.reply_text(
+            await status_message.edit_text(
                 f"❌ Ошибка при обработке файла: {str(e)}\n"
-                "Попробуйте еще раз или отправьте другой файл."
+                "Убедитесь, что файл содержит диалоги в формате [Персонаж]: текст"
             )
         
         finally:
