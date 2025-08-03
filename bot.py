@@ -31,6 +31,9 @@ if not BOT_TOKEN:
 if not HUGGINGFACE_API_KEY:
     logger.error("HUGGINGFACE_API_KEY environment variable is not set!")
     sys.exit(1)
+if not HUGGINGFACE_MODEL:
+    logger.error("HUGGINGFACE_MODEL environment variable is not set!")
+    sys.exit(1)
 if not WEBHOOK_URL:
     logger.error("WEBHOOK_URL environment variable is not set!")
     sys.exit(1)
@@ -42,6 +45,10 @@ TELEGRAM_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 executor = ThreadPoolExecutor(max_workers=3)
 
 def prepare_episode_text(text: str) -> str:
+    """
+    Подготавливает текст серии для анализа.
+    Не удаляет имена персонажей и скобки.
+    """
     lines = text.split('\n')
     cleaned_lines = []
     
@@ -157,7 +164,6 @@ def delete_message(chat_id: int, message_id: int):
 def download_file(file_id: str, file_path: str):
     """Загрузка файла"""
     try:
-        # Получаем информацию о файле
         data = {"file_id": file_id}
         result = send_telegram_request("getFile", data)
         
@@ -168,7 +174,6 @@ def download_file(file_id: str, file_path: str):
         file_info = result['result']
         file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info['file_path']}"
         
-        # Загружаем файл
         with urllib.request.urlopen(file_url, timeout=30) as response:
             with open(file_path, 'wb') as f:
                 f.write(response.read())
@@ -246,8 +251,10 @@ def call_huggingface_api(episode_text: str, file_name: str) -> str:
             return "⏳ Модель загружается, попробуйте через 1-2 минуты"
         elif e.code == 429:
             return "⏳ Превышены лимиты API, попробуйте позже"
+        elif e.code == 404:
+            logger.error(f"Hugging Face API Error 404. Model not found: {HUGGINGFACE_MODEL}")
+            return f"❌ Ошибка 404: модель {HUGGINGFACE_MODEL} не найдена. Проверьте имя модели в переменных окружения."
         else:
-            # ИЗМЕНЕНИЕ 1: Добавлено логирование проблемного текста
             logger.error(f"Hugging Face API Error {e.code}. Problematic text: {episode_text}")
             return f"❌ Ошибка API: {e.code}"
     except Exception as e:
@@ -336,7 +343,6 @@ def process_document(update_data: dict):
             
             send_message(chat_id, summary, parse_mode="Markdown", reply_to_message_id=message_id)
             
-            # ИЗМЕНЕНИЕ 2: Логирование успеха перенесено сюда, в конец блока try
             logger.info(f"Successfully created and sent summary for {file_name}")
             
         except Exception as e:
