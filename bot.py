@@ -2,12 +2,14 @@ import logging
 import os
 import sys
 import asyncio
-import requests
+import aiohttp
 from threading import Thread
 from flask import Flask, jsonify
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
+import time
+from docx import Document
 
 # Добавим отладку версии Python
 print(f"Running with Python version: {sys.version}")
@@ -33,7 +35,7 @@ def index():
 # Получение токенов и настроек
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
-HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "facebook/bart-large-cnn")
+HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "IlyaGusev/mbart_ru_sum_gazeta") # <- Изменил модель по умолчанию на русскую
 
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN environment variable is not set!")
@@ -71,7 +73,7 @@ async def summarize_episode_with_huggingface(episode_text: str, file_name: str) 
     """Создание краткого пересказа серии через Hugging Face API"""
     try:
         # Создаем специальный промпт для пересказа серии
-        prompt = f"""Создай краткий пересказ этой серии на основе диалогов персонажей. 
+        prompt = f"""Создай краткий пересказ этой серии на основе диалогов персонажей.
         
 ВАЖНЫЕ ТРЕБОВАНИЯ:
 - Используй ТОЛЬКО информацию из предоставленного текста
@@ -96,55 +98,43 @@ async def summarize_episode_with_huggingface(episode_text: str, file_name: str) 
         payload = {
             "inputs": prompt,
             "parameters": {
-                "max_length": 300,  # Увеличиваем для более подробного пересказа
+                "max_length": 300,
                 "min_length": 100,
                 "do_sample": False,
-                "temperature": 0.3,  # Низкая температура для точности
+                "temperature": 0.3,
                 "repetition_penalty": 1.1
             }
         }
         
-        # Выполняем запрос в отдельном потоке чтобы не блокировать async
-        def make_request():
-            try:
-                response = requests.post(api_url, headers=headers, json=payload, timeout=30)
-                return response
-            except Exception as e:
-                logger.error(f"Request error: {e}")
-                return None
-        
-        # Запускаем в executor для неблокирующего выполнения
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, make_request)
-        
-        if response is None:
-            return "❌ Ошибка соединения с API"
-        
-        if response.status_code == 200:
-            result = response.json()
-            if isinstance(result, list) and len(result) > 0:
-                summary = result[0].get('summary_text', '')
-                if not summary:
-                    # Пробуем получить generated_text если summary_text пустой
-                    summary = result[0].get('generated_text', '')
-                    # Убираем исходный промпт из ответа
-                    if prompt in summary:
-                        summary = summary.replace(prompt, '').strip()
-                
-                if summary:
-                    return format_episode_summary(summary, file_name)
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with session.post(api_url, headers=headers, json=payload) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    if isinstance(result, list) and len(result) > 0:
+                        summary = result[0].get('summary_text', '')
+                        if not summary:
+                            summary = result[0].get('generated_text', '')
+                            if prompt in summary:
+                                summary = summary.replace(prompt, '').strip()
+                        
+                        if summary:
+                            return format_episode_summary(summary, file_name)
+                        else:
+                            return "❌ Модель не смогла создать пересказ"
+                    else:
+                        return "❌ Неожиданный формат ответа от API"
+                elif response.status == 503:
+                    return "⏳ Модель загружается, попробуйте через 1-2 минуты"
+                elif response.status == 429:
+                    return "⏳ Превышены лимиты API, попробуйте позже"
                 else:
-                    return "❌ Модель не смогла создать пересказ"
-            else:
-                return "❌ Неожиданный формат ответа от API"
-        elif response.status_code == 503:
-            return "⏳ Модель загружается, попробуйте через 1-2 минуты"
-        elif response.status_code == 429:
-            return "⏳ Превышены лимиты API, попробуйте позже"
-        else:
-            logger.error(f"Hugging Face API error: {response.status_code} - {response.text}")
-            return f"❌ Ошибка API: {response.status_code}"
+                    error_text = await response.text()
+                    logger.error(f"Hugging Face API error: {response.status} - {error_text}")
+                    return f"❌ Ошибка API: {response.status}"
     
+    except asyncio.TimeoutError:
+        logger.error("Timeout calling Hugging Face API")
+        return "⏳ Таймаут API, попробуйте еще раз"
     except Exception as e:
         logger.error(f"Error calling Hugging Face API: {e}")
         return f"❌ Ошибка при обращении к API: {str(e)}"
@@ -166,7 +156,6 @@ _Пересказ создан на основе диалогов персона
 def extract_text_from_docx(file_path: str) -> str:
     """Извлечение текста из DOCX файла"""
     try:
-        from docx import Document
         doc = Document(file_path)
         text_parts = []
         
@@ -332,43 +321,49 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-def run_bot():
-    """Запуск Telegram бота в отдельном потоке"""
+def run_flask_app():
+    """Запуск Flask сервера в отдельном потоке"""
+    port = int(os.environ.get('PORT', 10000))
+    logger.info(f"Starting Flask server on port {port}")
+    # use_reloader=False - чтобы избежать двойного запуска в режиме отладки
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+async def run_bot_async():
+    """Асинхронный запуск Telegram бота"""
     try:
         logger.info("Starting Telegram bot...")
         
-        # Создаем приложение
         application = ApplicationBuilder().token(BOT_TOKEN).build()
         
-        # Добавляем обработчики
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
         
         logger.info("Bot handlers registered successfully")
         
-        # Запускаем бота
         logger.info("Starting polling...")
-        application.run_polling(
+        await application.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES
         )
         
     except Exception as e:
         logger.error(f"Failed to start bot: {e}")
+        # Выходим из приложения, если бот не запустился
+        os._exit(1)
 
 def main():
     """Главная функция"""
     logger.info("Starting application...")
-    
-    # Запускаем бота в отдельном потоке
-    bot_thread = Thread(target=run_bot)
-    bot_thread.daemon = True
-    bot_thread.start()
-    
-    # Запускаем Flask сервер для health checks
-    port = int(os.environ.get('PORT', 10000))
-    logger.info(f"Starting Flask server on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+
+    # Запускаем Flask в отдельном потоке
+    flask_thread = Thread(target=run_flask_app, daemon=True)
+    flask_thread.start()
+
+    # Даем Flask немного времени на запуск перед запуском бота
+    time.sleep(5) 
+
+    # Запускаем бота в основном асинхронном цикле
+    asyncio.run(run_bot_async())
 
 if __name__ == '__main__':
     main()
