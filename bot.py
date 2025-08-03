@@ -3,12 +3,15 @@ import os
 import sys
 import asyncio
 import aiohttp
+import requests
 from flask import Flask, request, jsonify
-from telegram import Update
+from telegram import Update, Bot
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 from docx import Document
 import threading
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 # Настройка логирования
 logging.basicConfig(
@@ -36,10 +39,13 @@ if not WEBHOOK_URL:
     logger.error("WEBHOOK_URL environment variable is not set!")
     sys.exit(1)
 
-# Глобальная переменная для хранения application
-application = None
+# Создаем синхронный бот для отправки сообщений
+sync_bot = Bot(token=BOT_TOKEN)
 
-# Функции для обработки текста и API (без изменений)
+# Thread pool для обработки файлов
+executor = ThreadPoolExecutor(max_workers=3)
+
+# Функции для обработки текста и API
 def prepare_episode_text(text: str) -> str:
     lines = text.split('\n')
     cleaned_lines = []
@@ -59,7 +65,8 @@ def prepare_episode_text(text: str) -> str:
     
     return episode_text
 
-async def summarize_episode_with_huggingface(episode_text: str, file_name: str) -> str:
+def summarize_episode_with_huggingface_sync(episode_text: str, file_name: str) -> str:
+    """Синхронная версия функции для вызова API"""
     try:
         prompt = f"""Создай краткий пересказ этой серии на основе диалогов персонажей.
         
@@ -94,33 +101,32 @@ async def summarize_episode_with_huggingface(episode_text: str, file_name: str) 
             }
         }
         
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.post(api_url, headers=headers, json=payload) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    if isinstance(result, list) and len(result) > 0:
-                        summary = result[0].get('summary_text', '')
-                        if not summary:
-                            summary = result[0].get('generated_text', '')
-                            if prompt in summary:
-                                summary = summary.replace(prompt, '').strip()
-                        
-                        if summary:
-                            return format_episode_summary(summary, file_name)
-                        else:
-                            return "❌ Модель не смогла создать пересказ"
-                    else:
-                        return "❌ Неожиданный формат ответа от API"
-                elif response.status == 503:
-                    return "⏳ Модель загружается, попробуйте через 1-2 минуты"
-                elif response.status == 429:
-                    return "⏳ Превышены лимиты API, попробуйте позже"
+        response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+        
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list) and len(result) > 0:
+                summary = result[0].get('summary_text', '')
+                if not summary:
+                    summary = result[0].get('generated_text', '')
+                    if prompt in summary:
+                        summary = summary.replace(prompt, '').strip()
+                
+                if summary:
+                    return format_episode_summary(summary, file_name)
                 else:
-                    error_text = await response.text()
-                    logger.error(f"Hugging Face API error: {response.status} - {error_text}")
-                    return f"❌ Ошибка API: {response.status}"
+                    return "❌ Модель не смогла создать пересказ"
+            else:
+                return "❌ Неожиданный формат ответа от API"
+        elif response.status_code == 503:
+            return "⏳ Модель загружается, попробуйте через 1-2 минуты"
+        elif response.status_code == 429:
+            return "⏳ Превышены лимиты API, попробуйте позже"
+        else:
+            logger.error(f"Hugging Face API error: {response.status_code} - {response.text}")
+            return f"❌ Ошибка API: {response.status_code}"
     
-    except asyncio.TimeoutError:
+    except requests.exceptions.Timeout:
         logger.error("Timeout calling Hugging Face API")
         return "⏳ Таймаут API, попробуйте еще раз"
     except Exception as e:
@@ -176,8 +182,209 @@ def extract_text_from_srt(file_path: str) -> str:
         logger.error(f"Error extracting text from SRT: {e}")
         raise e
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_message = """🎬 **Бот для пересказа серий**
+def send_message_sync(chat_id: int, text: str, parse_mode=None, reply_to_message_id=None):
+    """Синхронная отправка сообщения"""
+    try:
+        if parse_mode:
+            sync_bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                reply_to_message_id=reply_to_message_id
+            )
+        else:
+            sync_bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_to_message_id=reply_to_message_id
+            )
+        return True
+    except Exception as e:
+        logger.error(f"Error sending message: {e}")
+        return False
+
+def edit_message_sync(chat_id: int, message_id: int, text: str, parse_mode=None):
+    """Синхронное редактирование сообщения"""
+    try:
+        if parse_mode:
+            sync_bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode=parse_mode
+            )
+        else:
+            sync_bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text
+            )
+        return True
+    except Exception as e:
+        logger.error(f"Error editing message: {e}")
+        return False
+
+def delete_message_sync(chat_id: int, message_id: int):
+    """Синхронное удаление сообщения"""
+    try:
+        sync_bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
+    except Exception as e:
+        logger.error(f"Error deleting message: {e}")
+        return False
+
+def download_file_sync(file_id: str, file_path: str):
+    """Синхронная загрузка файла"""
+    try:
+        file_info = sync_bot.get_file(file_id)
+        file_info.download_to_drive(file_path)
+        return True
+    except Exception as e:
+        logger.error(f"Error downloading file: {e}")
+        return False
+
+def process_document_sync(update_data: dict):
+    """Синхронная обработка документа"""
+    try:
+        logger.info("Processing document synchronously")
+        
+        # Получаем данные из update
+        if 'message' in update_data:
+            message_data = update_data['message']
+        elif 'channel_post' in update_data:
+            message_data = update_data['channel_post']
+        else:
+            logger.error("No message or channel_post in update")
+            return
+        
+        if 'document' not in message_data:
+            logger.error("No document in message")
+            return
+        
+        chat_id = message_data['chat']['id']
+        message_id = message_data['message_id']
+        document = message_data['document']
+        
+        file_name = document.get('file_name', 'unknown')
+        file_size = document.get('file_size', 0)
+        file_id = document['file_id']
+        
+        logger.info(f"Processing file: {file_name}, size: {file_size} bytes")
+        
+        if file_size > 20 * 1024 * 1024:
+            send_message_sync(chat_id, "❌ Файл слишком большой (максимум 20MB)")
+            return
+        
+        if not (file_name.lower().endswith('.docx') or file_name.lower().endswith('.srt')):
+            send_message_sync(
+                chat_id,
+                "❌ Поддерживаются только файлы .srt (субтитры) и .docx (документы)\n"
+                "Отправьте файл субтитров с диалогами персонажей."
+            )
+            return
+        
+        # Отправляем статусное сообщение
+        status_response = sync_bot.send_message(chat_id, "🔄 Анализирую диалоги персонажей...")
+        status_message_id = status_response.message_id
+        
+        file_path = f"/tmp/{file_name}"
+        
+        try:
+            # Загружаем файл
+            logger.info("Downloading file...")
+            if not download_file_sync(file_id, file_path):
+                edit_message_sync(chat_id, status_message_id, "❌ Ошибка при загрузке файла")
+                return
+            
+            # Извлекаем текст
+            logger.info("Extracting dialogue text...")
+            if file_name.lower().endswith('.docx'):
+                raw_text = extract_text_from_docx(file_path)
+            else:
+                raw_text = extract_text_from_srt(file_path)
+            
+            if not raw_text or not raw_text.strip():
+                edit_message_sync(chat_id, status_message_id, "❌ Файл не содержит диалогов персонажей")
+                return
+            
+            episode_text = prepare_episode_text(raw_text)
+            
+            if not episode_text or len(episode_text) < 100:
+                edit_message_sync(chat_id, status_message_id, "❌ Недостаточно диалогов для создания пересказа")
+                return
+            
+            edit_message_sync(chat_id, status_message_id, "🤖 Создаю пересказ серии...")
+            
+            # Создаем пересказ
+            logger.info("Creating episode summary...")
+            summary = summarize_episode_with_huggingface_sync(episode_text, file_name)
+            
+            # Удаляем статусное сообщение
+            delete_message_sync(chat_id, status_message_id)
+            
+            # Отправляем результат
+            send_message_sync(
+                chat_id,
+                summary,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_to_message_id=message_id
+            )
+            
+            logger.info("Successfully created episode summary")
+            
+        except Exception as e:
+            logger.error(f"Error processing file {file_name}: {e}")
+            edit_message_sync(
+                chat_id,
+                status_message_id,
+                f"❌ Ошибка при обработке файла: {str(e)}\n"
+                "Убедитесь, что файл содержит диалоги в формате [Персонаж]: текст"
+            )
+        finally:
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    logger.info("Temporary file removed")
+                except Exception as e:
+                    logger.error(f"Error removing temp file: {e}")
+    
+    except Exception as e:
+        logger.error(f"Unexpected error in process_document_sync: {e}")
+
+def setup_webhook_sync():
+    """Синхронная настройка вебхука"""
+    try:
+        webhook_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+        sync_bot.set_webhook(webhook_url)
+        logger.info(f"Webhook set to {webhook_url}")
+        return True
+    except Exception as e:
+        logger.error(f"Error setting webhook: {e}")
+        return False
+
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+def webhook_handler():
+    """Обработчик вебхука"""
+    try:
+        update_json = request.get_json(force=True)
+        logger.info(f"Received webhook update: {update_json}")
+        
+        # Проверяем, есть ли документ в сообщении
+        has_document = False
+        if 'message' in update_json and 'document' in update_json['message']:
+            has_document = True
+        elif 'channel_post' in update_json and 'document' in update_json['channel_post']:
+            has_document = True
+        
+        if has_document:
+            # Обрабатываем документ в отдельном потоке
+            executor.submit(process_document_sync, update_json)
+        elif 'message' in update_json and update_json['message'].get('text', '').startswith('/start'):
+            # Обрабатываем команду /start
+            message_data = update_json['message']
+            chat_id = message_data['chat']['id']
+            
+            welcome_message = """🎬 **Бот для пересказа серий**
 
 Отправьте мне файл субтитров или документ:
 🎬 `.srt` - файл субтитров с диалогами персонажей
@@ -188,200 +395,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **Важно:** Я использую только информацию из вашего файла и не добавляю ничего от себя.
 
 Просто отправьте файл и ждите пересказ!"""
-    
-    message = update.message or update.channel_post
-    if message:
-        await message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        logger.info("Received document message")
-        
-        # Поддерживаем как личные сообщения, так и сообщения в каналах
-        message = update.message or update.channel_post
-        if not message or not message.document:
-            logger.warning("No document in message")
-            return
-        
-        file = message.document
-        file_name = file.file_name or "unknown"
-        file_size = file.file_size or 0
-        
-        logger.info(f"Processing file: {file_name}, size: {file_size} bytes")
-        
-        if file_size > 20 * 1024 * 1024:
-            await message.reply_text("❌ Файл слишком большой (максимум 20MB)")
-            return
-        
-        if not (file_name.lower().endswith('.docx') or file_name.lower().endswith('.srt')):
-            await message.reply_text(
-                "❌ Поддерживаются только файлы .srt (субтитры) и .docx (документы)\n"
-                "Отправьте файл субтитров с диалогами персонажей."
-            )
-            return
-        
-        status_message = await message.reply_text("🔄 Анализирую диалоги персонажей...")
-        
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id, 
-            action=ChatAction.TYPING
-        )
-        
-        file_path = f"/tmp/{file_name}"
-        
-        try:
-            logger.info("Downloading file...")
-            file_obj = await file.get_file()
-            await file_obj.download_to_drive(file_path)
             
-            logger.info("Extracting dialogue text...")
-            if file_name.lower().endswith('.docx'):
-                raw_text = extract_text_from_docx(file_path)
-            else:
-                raw_text = extract_text_from_srt(file_path)
-            
-            if not raw_text or not raw_text.strip():
-                await status_message.edit_text("❌ Файл не содержит диалогов персонажей")
-                return
-            
-            episode_text = prepare_episode_text(raw_text)
-            
-            if not episode_text or len(episode_text) < 100:
-                await status_message.edit_text("❌ Недостаточно диалогов для создания пересказа")
-                return
-            
-            await status_message.edit_text("🤖 Создаю пересказ серии...")
-            
-            logger.info("Creating episode summary...")
-            summary = await summarize_episode_with_huggingface(episode_text, file_name)
-            
-            try:
-                await status_message.delete()
-            except Exception as e:
-                logger.warning(f"Could not delete status message: {e}")
-            
-            await message.reply_text(
-                summary, 
-                parse_mode=ParseMode.MARKDOWN,
-                reply_to_message_id=message.message_id
-            )
-            
-            logger.info("Successfully created episode summary")
-        except Exception as e:
-            logger.error(f"Error processing file {file_name}: {e}")
-            try:
-                await status_message.edit_text(
-                    f"❌ Ошибка при обработке файла: {str(e)}\n"
-                    "Убедитесь, что файл содержит диалоги в формате [Персонаж]: текст"
-                )
-            except Exception as edit_error:
-                logger.error(f"Could not edit status message: {edit_error}")
-                try:
-                    await message.reply_text("❌ Произошла ошибка при обработке файла")
-                except Exception as reply_error:
-                    logger.error(f"Could not send error message: {reply_error}")
-        finally:
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                    logger.info("Temporary file removed")
-                except Exception as e:
-                    logger.error(f"Error removing temp file: {e}")
-    
-    except Exception as e:
-        logger.error(f"Unexpected error in handle_document: {e}")
-        try:
-            message = update.message or update.channel_post
-            if message:
-                await message.reply_text("❌ Произошла непредвиденная ошибка")
-        except:
-            pass
-
-def run_async_task(coro):
-    """Функция для запуска асинхронных задач в синхронном контексте"""
-    try:
-        # Пытаемся использовать существующий цикл событий
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Если цикл уже запущен, создаем новый поток
-            result = asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=30)
-            return result
-        else:
-            return loop.run_until_complete(coro)
-    except RuntimeError:
-        # Если нет активного цикла, создаем новый
-        return asyncio.run(coro)
-
-async def init_application():
-    """Инициализация приложения"""
-    global application
-    if application is not None:
-        return application
-        
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    # Добавляем обработчики для сообщений и сообщений в каналах
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    
-    # Инициализация приложения
-    await application.initialize()
-    logger.info("Application initialized successfully")
-    return application
-
-async def setup_webhook():
-    """Настройка вебхука"""
-    global application
-    if application is None:
-        application = await init_application()
-    
-    await application.bot.set_webhook(f"{WEBHOOK_URL}/{BOT_TOKEN}")
-    logger.info(f"Webhook set to {WEBHOOK_URL}/{BOT_TOKEN}")
-
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
-def webhook_handler():
-    """Синхронный обработчик вебхука"""
-    try:
-        update_json = request.get_json(force=True)
-        logger.info(f"Received webhook update: {update_json}")
-        
-        global application
-        if application is None:
-            logger.error("Application not initialized")
-            return "error", 500
-        
-        update = Update.de_json(update_json, application.bot)
-        
-        # Запускаем асинхронную обработку в отдельном потоке с новым циклом событий
-        def process_update():
-            try:
-                # Создаем новый цикл событий для этого потока
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
-                # Инициализируем приложение в новом цикле
-                async def run_update():
-                    try:
-                        await application.process_update(update)
-                    except Exception as e:
-                        logger.error(f"Error processing update: {e}")
-                
-                # Выполняем обработку
-                loop.run_until_complete(run_update())
-                
-            except Exception as e:
-                logger.error(f"Error in update processing thread: {e}")
-            finally:
-                # Закрываем цикл только после завершения всех операций
-                try:
-                    loop.close()
-                except:
-                    pass
-        
-        # Запускаем в отдельном потоке и не ждем завершения
-        thread = threading.Thread(target=process_update)
-        thread.daemon = True
-        thread.start()
+            send_message_sync(chat_id, welcome_message, parse_mode=ParseMode.MARKDOWN)
         
         return "ok"
     except Exception as e:
@@ -397,9 +412,11 @@ def main():
     """Главная функция для запуска Flask-сервера и настройки вебхука"""
     port = int(os.environ.get('PORT', 10000))
 
-    # Инициализируем приложение и настраиваем вебхук
-    logger.info("Initializing application and setting up webhook...")
-    asyncio.run(setup_webhook())
+    # Настраиваем вебхук
+    logger.info("Setting up webhook...")
+    if not setup_webhook_sync():
+        logger.error("Failed to set up webhook")
+        sys.exit(1)
 
     # Запускаем Flask-приложение
     logger.info(f"Starting Flask server on port {port}")
