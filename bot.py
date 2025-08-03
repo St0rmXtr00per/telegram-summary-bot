@@ -3,16 +3,11 @@ import os
 import sys
 import asyncio
 import aiohttp
-from threading import Thread
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
-import time
 from docx import Document
-
-# Добавим отладку версии Python
-print(f"Running with Python version: {sys.version}")
 
 # Настройка логирования
 logging.basicConfig(
@@ -21,21 +16,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Flask app для health check
+# Flask app для health check и вебхука
 app = Flask(__name__)
-
-@app.route('/health')
-def health_check():
-    return jsonify({"status": "healthy", "service": "telegram-bot"}), 200
-
-@app.route('/')
-def index():
-    return jsonify({"message": "Telegram Summary Bot is running"}), 200
 
 # Получение токенов и настроек
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
-HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "IlyaGusev/mbart_ru_sum_gazeta") # <- Изменил модель по умолчанию на русскую
+HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "IlyaGusev/mbart_ru_sum_gazeta")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN environment variable is not set!")
@@ -45,6 +33,16 @@ if not HUGGINGFACE_API_KEY:
     logger.error("HUGGINGFACE_API_KEY environment variable is not set!")
     sys.exit(1)
 
+if not WEBHOOK_URL:
+    logger.error("WEBHOOK_URL environment variable is not set!")
+    sys.exit(1)
+
+# Инициализация бота
+application = ApplicationBuilder().token(BOT_TOKEN).build()
+application.add_handler(CommandHandler("start", start_command))
+application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+# Функции для обработки текста и API (без изменений)
 def prepare_episode_text(text: str) -> str:
     """Подготавливает текст серии для анализа"""
     lines = text.split('\n')
@@ -53,17 +51,13 @@ def prepare_episode_text(text: str) -> str:
     for line in lines:
         line = line.strip()
         if line and '[' in line and ']' in line:
-            # Убираем временные метки и нумерацию субтитров
             if '-->' not in line and not line.isdigit():
                 cleaned_lines.append(line)
     
-    # Соединяем диалоги в читаемый текст
     episode_text = ' '.join(cleaned_lines)
     
-    # Ограничиваем длину для API (оставляем место для промпта)
     max_chars = 3000
     if len(episode_text) > max_chars:
-        # Берем начало и конец серии, чтобы сохранить контекст
         quarter = max_chars // 4
         episode_text = episode_text[:quarter*3] + "..." + episode_text[-quarter:]
     
@@ -72,7 +66,6 @@ def prepare_episode_text(text: str) -> str:
 async def summarize_episode_with_huggingface(episode_text: str, file_name: str) -> str:
     """Создание краткого пересказа серии через Hugging Face API"""
     try:
-        # Создаем специальный промпт для пересказа серии
         prompt = f"""Создай краткий пересказ этой серии на основе диалогов персонажей.
         
 ВАЖНЫЕ ТРЕБОВАНИЯ:
@@ -141,10 +134,7 @@ async def summarize_episode_with_huggingface(episode_text: str, file_name: str) 
 
 def format_episode_summary(summary: str, file_name: str) -> str:
     """Форматирует пересказ для отправки в Telegram со сворачиваемым блоком"""
-    # Убираем название файла из расширения для заголовка
     episode_name = file_name.replace('.srt', '').replace('.docx', '')
-    
-    # Создаем сворачиваемый блок (spoiler в Telegram)
     formatted_summary = f"""📺 **Краткий пересказ: {episode_name}**
 
 ||{summary.strip()}||
@@ -158,7 +148,6 @@ def extract_text_from_docx(file_path: str) -> str:
     try:
         doc = Document(file_path)
         text_parts = []
-        
         for paragraph in doc.paragraphs:
             if paragraph.text.strip():
                 text_parts.append(paragraph.text.strip())
@@ -166,7 +155,6 @@ def extract_text_from_docx(file_path: str) -> str:
         full_text = '\n'.join(text_parts)
         logger.info(f"Extracted {len(full_text)} characters from DOCX")
         return full_text
-        
     except Exception as e:
         logger.error(f"Error extracting text from DOCX: {e}")
         raise e
@@ -177,14 +165,12 @@ def extract_text_from_srt(file_path: str) -> str:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        # Разбиваем на блоки субтитров
         blocks = content.strip().split('\n\n')
         dialogue_lines = []
         
         for block in blocks:
             lines = block.strip().split('\n')
-            if len(lines) >= 3:  # Номер, время, текст
-                # Берем все строки после времени (может быть многострочный диалог)
+            if len(lines) >= 3:
                 text_lines = lines[2:]
                 for text_line in text_lines:
                     text_line = text_line.strip()
@@ -194,7 +180,6 @@ def extract_text_from_srt(file_path: str) -> str:
         full_text = '\n'.join(dialogue_lines)
         logger.info(f"Extracted {len(dialogue_lines)} dialogue lines from SRT")
         return full_text
-        
     except Exception as e:
         logger.error(f"Error extracting text from SRT: {e}")
         raise e
@@ -217,6 +202,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик документов"""
+    # ... (код остается без изменений) ...
     try:
         logger.info("Received document message")
         
@@ -230,12 +216,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         logger.info(f"Processing file: {file_name}, size: {file_size} bytes")
         
-        # Проверяем размер файла
         if file_size > 20 * 1024 * 1024:
             await update.message.reply_text("❌ Файл слишком большой (максимум 20MB)")
             return
         
-        # Проверяем поддерживаемые форматы
         if not (file_name.lower().endswith('.docx') or file_name.lower().endswith('.srt')):
             await update.message.reply_text(
                 "❌ Поддерживаются только файлы .srt (субтитры) и .docx (документы)\n"
@@ -243,53 +227,43 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # Уведомляем пользователя
         status_message = await update.message.reply_text("🔄 Анализирую диалоги персонажей...")
         
-        # Показываем активность
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id, 
             action=ChatAction.TYPING
         )
         
-        # Создаем временный файл
         file_path = f"/tmp/{file_name}"
         
         try:
-            # Скачиваем файл
             logger.info("Downloading file...")
             file_obj = await file.get_file()
             await file_obj.download_to_drive(file_path)
             
-            # Извлекаем текст
             logger.info("Extracting dialogue text...")
             if file_name.lower().endswith('.docx'):
                 raw_text = extract_text_from_docx(file_path)
-            else:  # .srt
+            else:
                 raw_text = extract_text_from_srt(file_path)
             
             if not raw_text or not raw_text.strip():
                 await status_message.edit_text("❌ Файл не содержит диалогов персонажей")
                 return
             
-            # Подготавливаем текст для анализа
             episode_text = prepare_episode_text(raw_text)
             
             if not episode_text or len(episode_text) < 100:
                 await status_message.edit_text("❌ Недостаточно диалогов для создания пересказа")
                 return
             
-            # Обновляем статус
             await status_message.edit_text("🤖 Создаю пересказ серии...")
             
-            # Создаем пересказ через Hugging Face
             logger.info("Creating episode summary...")
             summary = await summarize_episode_with_huggingface(episode_text, file_name)
             
-            # Удаляем статусное сообщение
             await status_message.delete()
             
-            # Отправляем пересказ как ответ на файл
             await update.message.reply_text(
                 summary, 
                 parse_mode=ParseMode.MARKDOWN,
@@ -297,16 +271,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             logger.info("Successfully created episode summary")
-            
         except Exception as e:
             logger.error(f"Error processing file {file_name}: {e}")
             await status_message.edit_text(
                 f"❌ Ошибка при обработке файла: {str(e)}\n"
                 "Убедитесь, что файл содержит диалоги в формате [Персонаж]: текст"
             )
-        
         finally:
-            # Удаляем временный файл
             if os.path.exists(file_path):
                 try:
                     os.remove(file_path)
@@ -321,57 +292,41 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-def run_flask_app():
-    """Запуск Flask сервера в отдельном потоке"""
-    port = int(os.environ.get('PORT', 10000))
-    logger.info(f"Starting Flask server on port {port}")
-    # use_reloader=False - чтобы избежать двойного запуска в режиме отладки
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+@app.route('/health')
+def health_check():
+    return jsonify({"status": "healthy", "service": "telegram-bot"}), 200
 
-async def run_bot_async(loop):
-    """Асинхронный запуск Telegram бота"""
+@app.route('/')
+def index():
+    return jsonify({"message": "Telegram Summary Bot is running"}), 200
+
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+async def webhook_handler():
     try:
-        logger.info("Starting Telegram bot...")
-        
-        application = ApplicationBuilder().token(BOT_TOKEN).build()
-        
-        application.add_handler(CommandHandler("start", start_command))
-        application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-        
-        logger.info("Bot handlers registered successfully")
-        
-        logger.info("Starting polling...")
-        await application.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
-        )
-        
+        update_json = await request.get_json(force=True)
+        update = Update.de_json(update_json, application.bot)
+        await application.process_update(update)
+        return "ok"
     except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
-        # Завершаем цикл, если бот не запустился
-        loop.stop()
+        logger.error(f"Error processing webhook update: {e}")
+        return "error", 500
 
-def start_bot_thread():
-    """Запуск бота в отдельном потоке с асинхронным циклом"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(run_bot_async(loop))
+async def setup_webhook():
+    """Настройка вебхука"""
+    await application.bot.set_webhook(f"{WEBHOOK_URL}/{BOT_TOKEN}")
+    logger.info(f"Webhook set to {WEBHOOK_URL}/{BOT_TOKEN}")
 
 def main():
-    """Главная функция"""
-    logger.info("Starting application...")
+    """Главная функция для запуска Flask-сервера и настройки вебхука"""
+    # Запускаем Flask-сервер в режиме вебхука
+    port = int(os.environ.get('PORT', 10000))
 
-    # Запускаем Flask в отдельном потоке
-    flask_thread = Thread(target=run_flask_app, daemon=True)
-    flask_thread.start()
+    # Сначала настраиваем вебхук
+    asyncio.run(setup_webhook())
 
-    # Запускаем бота в отдельном потоке, чтобы не блокировать основной
-    bot_thread = Thread(target=start_bot_thread, daemon=True)
-    bot_thread.start()
-
-    # Просто держим главный поток живым, пока работают другие
-    while True:
-        time.sleep(1)
+    # Затем запускаем Flask-приложение
+    logger.info(f"Starting Flask server on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=False)
 
 if __name__ == '__main__':
     main()
