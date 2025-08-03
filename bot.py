@@ -304,7 +304,8 @@ def index():
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 async def webhook_handler():
     try:
-        update_json = request.get_json(force=True)  # <-- ИСПРАВЛЕНО
+        await application.initialize()
+        update_json = request.get_json(force=True)
         update = Update.de_json(update_json, application.bot)
         await application.process_update(update)
         return "ok"
@@ -330,4 +331,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
