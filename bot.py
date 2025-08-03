@@ -40,14 +40,122 @@ if not WEBHOOK_URL:
     logger.error("WEBHOOK_URL environment variable is not set!")
     sys.exit(1)
 
-# Создаем синхронный бот для отправки сообщений
-sync_bot = Bot(token=BOT_TOKEN)
+# Создаем базовый URL для API
+TELEGRAM_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Thread pool для обработки файлов
-executor = ThreadPoolExecutor(max_workers=3)
+def send_message_sync(chat_id: int, text: str, parse_mode=None, reply_to_message_id=None):
+    """Синхронная отправка сообщения через HTTP API"""
+    try:
+        url = f"{TELEGRAM_API_BASE}/sendMessage"
+        
+        data = {
+            "chat_id": chat_id,
+            "text": text
+        }
+        
+        if parse_mode:
+            data["parse_mode"] = parse_mode
+        if reply_to_message_id:
+            data["reply_to_message_id"] = reply_to_message_id
+        
+        # Кодируем данные для POST запроса
+        post_data = urllib.parse.urlencode(data).encode('utf-8')
+        
+        req = urllib.request.Request(url, data=post_data)
+        req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            if result.get('ok'):
+                return result['result']
+            else:
+                logger.error(f"Telegram API error: {result}")
+                return None
+                
+    except Exception as e:
+        logger.error(f"Error sending message: {e}")
+        return None
 
-# Функции для обработки текста и API
-def prepare_episode_text(text: str) -> str:
+def edit_message_sync(chat_id: int, message_id: int, text: str, parse_mode=None):
+    """Синхронное редактирование сообщения через HTTP API"""
+    try:
+        url = f"{TELEGRAM_API_BASE}/editMessageText"
+        
+        data = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text
+        }
+        
+        if parse_mode:
+            data["parse_mode"] = parse_mode
+        
+        post_data = urllib.parse.urlencode(data).encode('utf-8')
+        
+        req = urllib.request.Request(url, data=post_data)
+        req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            return result.get('ok', False)
+                
+    except Exception as e:
+        logger.error(f"Error editing message: {e}")
+        return False
+
+def delete_message_sync(chat_id: int, message_id: int):
+    """Синхронное удаление сообщения через HTTP API"""
+    try:
+        url = f"{TELEGRAM_API_BASE}/deleteMessage"
+        
+        data = {
+            "chat_id": chat_id,
+            "message_id": message_id
+        }
+        
+        post_data = urllib.parse.urlencode(data).encode('utf-8')
+        
+        req = urllib.request.Request(url, data=post_data)
+        req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            return result.get('ok', False)
+                
+    except Exception as e:
+        logger.error(f"Error deleting message: {e}")
+        return False
+
+def download_file_sync(file_id: str, file_path: str):
+    """Синхронная загрузка файла через HTTP API"""
+    try:
+        # Сначала получаем информацию о файле
+        url = f"{TELEGRAM_API_BASE}/getFile"
+        data = urllib.parse.urlencode({"file_id": file_id}).encode('utf-8')
+        
+        req = urllib.request.Request(url, data=data)
+        req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            
+            if not result.get('ok'):
+                logger.error(f"Failed to get file info: {result}")
+                return False
+            
+            file_info = result['result']
+            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info['file_path']}"
+            
+            # Загружаем файл
+            with urllib.request.urlopen(file_url, timeout=30) as file_response:
+                with open(file_path, 'wb') as f:
+                    f.write(file_response.read())
+            
+            return True
+                
+    except Exception as e:
+        logger.error(f"Error downloading file: {e}")
+        return False
     lines = text.split('\n')
     cleaned_lines = []
     
@@ -198,66 +306,11 @@ def extract_text_from_srt(file_path: str) -> str:
         logger.error(f"Error extracting text from SRT: {e}")
         raise e
 
-def send_message_sync(chat_id: int, text: str, parse_mode=None, reply_to_message_id=None):
-    """Синхронная отправка сообщения"""
-    try:
-        if parse_mode:
-            sync_bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode=parse_mode,
-                reply_to_message_id=reply_to_message_id
-            )
-        else:
-            sync_bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_to_message_id=reply_to_message_id
-            )
-        return True
-    except Exception as e:
-        logger.error(f"Error sending message: {e}")
-        return False
+# Thread pool для обработки файлов
+executor = ThreadPoolExecutor(max_workers=3)
 
-def edit_message_sync(chat_id: int, message_id: int, text: str, parse_mode=None):
-    """Синхронное редактирование сообщения"""
-    try:
-        if parse_mode:
-            sync_bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                parse_mode=parse_mode
-            )
-        else:
-            sync_bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text
-            )
-        return True
-    except Exception as e:
-        logger.error(f"Error editing message: {e}")
-        return False
-
-def delete_message_sync(chat_id: int, message_id: int):
-    """Синхронное удаление сообщения"""
-    try:
-        sync_bot.delete_message(chat_id=chat_id, message_id=message_id)
-        return True
-    except Exception as e:
-        logger.error(f"Error deleting message: {e}")
-        return False
-
-def download_file_sync(file_id: str, file_path: str):
-    """Синхронная загрузка файла"""
-    try:
-        file_info = sync_bot.get_file(file_id)
-        file_info.download_to_drive(file_path)
-        return True
-    except Exception as e:
-        logger.error(f"Error downloading file: {e}")
-        return False
+# Функции для обработки текста и API
+def prepare_episode_text(text: str) -> str:
 
 def process_document_sync(update_data: dict):
     """Синхронная обработка документа"""
@@ -300,8 +353,11 @@ def process_document_sync(update_data: dict):
             return
         
         # Отправляем статусное сообщение
-        status_response = sync_bot.send_message(chat_id, "🔄 Анализирую диалоги персонажей...")
-        status_message_id = status_response.message_id
+        status_response = send_message_sync(chat_id, "🔄 Анализирую диалоги персонажей...")
+        if not status_response:
+            logger.error("Failed to send status message")
+            return
+        status_message_id = status_response['message_id']
         
         file_path = f"/tmp/{file_name}"
         
@@ -371,9 +427,23 @@ def setup_webhook_sync():
     """Синхронная настройка вебхука"""
     try:
         webhook_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
-        sync_bot.set_webhook(webhook_url)
-        logger.info(f"Webhook set to {webhook_url}")
-        return True
+        url = f"{TELEGRAM_API_BASE}/setWebhook"
+        
+        data = urllib.parse.urlencode({"url": webhook_url}).encode('utf-8')
+        
+        req = urllib.request.Request(url, data=data)
+        req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            
+            if result.get('ok'):
+                logger.info(f"Webhook set to {webhook_url}")
+                return True
+            else:
+                logger.error(f"Failed to set webhook: {result}")
+                return False
+                
     except Exception as e:
         logger.error(f"Error setting webhook: {e}")
         return False
