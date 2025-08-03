@@ -3,8 +3,10 @@ services:
     name: telegram-summary-bot
     env: python
     plan: free
+    pythonVersion: "3.11"  # Добавляем эту строку
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
         sync: false
+
