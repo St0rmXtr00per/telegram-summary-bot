@@ -3,7 +3,7 @@ import os
 import sys
 import asyncio
 import aiohttp
-from flask import Flask, jsonify, request
+from flask import Flask, request
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
@@ -16,30 +16,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Flask app для health check и вебхука
-app = Flask(__name__)
-
 # Получение токенов и настроек
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
 HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "IlyaGusev/mbart_ru_sum_gazeta")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+PORT = int(os.environ.get('PORT', 10000))
 
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN environment variable is not set!")
     sys.exit(1)
-
 if not HUGGINGFACE_API_KEY:
     logger.error("HUGGINGFACE_API_KEY environment variable is not set!")
     sys.exit(1)
-
 if not WEBHOOK_URL:
     logger.error("WEBHOOK_URL environment variable is not set!")
     sys.exit(1)
 
 # Функции для обработки текста и API (без изменений)
 def prepare_episode_text(text: str) -> str:
-    """Подготавливает текст серии для анализа"""
     lines = text.split('\n')
     cleaned_lines = []
     
@@ -59,7 +54,6 @@ def prepare_episode_text(text: str) -> str:
     return episode_text
 
 async def summarize_episode_with_huggingface(episode_text: str, file_name: str) -> str:
-    """Создание краткого пересказа серии через Hugging Face API"""
     try:
         prompt = f"""Создай краткий пересказ этой серии на основе диалогов персонажей.
         
@@ -128,7 +122,6 @@ async def summarize_episode_with_huggingface(episode_text: str, file_name: str) 
         return f"❌ Ошибка при обращении к API: {str(e)}"
 
 def format_episode_summary(summary: str, file_name: str) -> str:
-    """Форматирует пересказ для отправки в Telegram со сворачиваемым блоком"""
     episode_name = file_name.replace('.srt', '').replace('.docx', '')
     formatted_summary = f"""📺 **Краткий пересказ: {episode_name}**
 
@@ -139,7 +132,6 @@ _Пересказ создан на основе диалогов персона
     return formatted_summary
 
 def extract_text_from_docx(file_path: str) -> str:
-    """Извлечение текста из DOCX файла"""
     try:
         doc = Document(file_path)
         text_parts = []
@@ -155,7 +147,6 @@ def extract_text_from_docx(file_path: str) -> str:
         raise e
 
 def extract_text_from_srt(file_path: str) -> str:
-    """Извлечение текста из SRT файла с сохранением структуры диалогов"""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -180,7 +171,6 @@ def extract_text_from_srt(file_path: str) -> str:
         raise e
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
     welcome_message = """🎬 **Бот для пересказа серий**
 
 Отправьте мне файл субтитров или документ:
@@ -196,7 +186,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик документов"""
     try:
         logger.info("Received document message")
         
@@ -289,45 +278,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Инициализация бота
 application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-# Теперь мы добавляем обработчики, когда все функции уже определены
+# Добавляем обработчики
 application.add_handler(CommandHandler("start", start_command))
 application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-@app.route('/health')
-def health_check():
-    return jsonify({"status": "healthy", "service": "telegram-bot"}), 200
+async def main():
+    """Главная асинхронная функция для запуска бота"""
+    await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
+        url_path=f"/{BOT_TOKEN}"
+    )
 
-@app.route('/')
-def index():
-    return jsonify({"message": "Telegram Summary Bot is running"}), 200
-
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
-async def webhook_handler():
-    try:
-        update_json = request.get_json(force=True)
-        update = Update.de_json(update_json, application.bot)
-        await application.process_update(update)
-        return "ok"
-    except Exception as e:
-        logger.error(f"Error processing webhook update: {e}")
-        return "error", 500
-
-async def setup_webhook():
-    """Настройка вебхука и инициализация приложения"""
-    await application.initialize()
-    await application.bot.set_webhook(f"{WEBHOOK_URL}/{BOT_TOKEN}")
-    logger.info(f"Webhook set to {WEBHOOK_URL}/{BOT_TOKEN}")
-
-def main():
-    """Главная функция для запуска Flask-сервера и настройки вебхука"""
-    port = int(os.environ.get('PORT', 10000))
-
-    # Сначала настраиваем вебхук
-    asyncio.run(setup_webhook())
-
-    # Затем запускаем Flask-приложение
-    logger.info(f"Starting Flask server on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    asyncio.run(main())
