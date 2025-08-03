@@ -49,7 +49,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(file_path)
 
 def main():
-    application = Application(bot=bot)
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.run_polling()
 
