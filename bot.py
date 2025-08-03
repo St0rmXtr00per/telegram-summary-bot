@@ -2,8 +2,7 @@ import logging
 import os
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
-from docx import Document
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 logging.basicConfig(level=logging.INFO)
 
@@ -13,6 +12,7 @@ async def summarize_text(text: str) -> str:
     return f"Сводка:\n{text[:500]}..."
 
 def extract_text_from_docx(file_path: str) -> str:
+    from docx import Document
     doc = Document(file_path)
     return '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
 
@@ -48,9 +48,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(file_path)
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.run_polling()
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
